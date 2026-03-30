@@ -210,11 +210,28 @@ PALETTE = [
     "FFF2CC",  # amarillo claro
 ]
 
+def _darken(hex_color: str, factor: float = 0.75) -> str:
+    """Return a darker version of a hex color."""
+    r = int(int(hex_color[0:2], 16) * factor)
+    g = int(int(hex_color[2:4], 16) * factor)
+    b = int(int(hex_color[4:6], 16) * factor)
+    return f"{r:02X}{g:02X}{b:02X}"
+
+# Especial colors: same palette but darker
+PALETTE_ESP = [_darken(c) for c in PALETTE]
+
 def build_block_color_map_for_day(day_code: str) -> Dict[str, str]:
     m: Dict[str, str] = {}
     for i in range(6):
         key = f"{day_code}{i}"
         m[key] = PALETTE[i % len(PALETTE)]
+    return m
+
+def build_especial_color_map_for_day(day_code: str) -> Dict[str, str]:
+    m: Dict[str, str] = {}
+    for i in range(6):
+        key = f"{day_code}{i}"
+        m[key] = PALETTE_ESP[i % len(PALETTE_ESP)]
     return m
 
 
@@ -268,6 +285,7 @@ def compute_day_usage(
     block_intervals: Optional[Dict[str, Tuple[int,int]]] = None,
 ) -> Tuple[Dict[str, Dict[str, Set[int]]], int]:
     warnings = 0
+    especial_usage: Dict[str, Dict[str, Set[int]]] = defaultdict(lambda: defaultdict(set))
 
     desc_col = find_col(grupo_df, ["Descripción Grupos de destino", "Descripcion Grupos de destino", "DESCRIPCION GRUPOS DE DESTINO"])
     elem_col = find_col(grupo_df, ["Elemento", "ELEMENTO"])
@@ -318,8 +336,11 @@ def compute_day_usage(
                     continue
 
             usage[block_token][sub].add(slot)
+            # Track if this entry is an especial
+            if 'ESPECIAL' in str(r[desc_col]).upper():
+                especial_usage[block_token][sub].add(slot)
 
-    return usage, warnings
+    return usage, warnings, especial_usage
 
 
 # -----------------------------
@@ -348,6 +369,8 @@ def write_day_sheet(
     block_colors: Dict[str, str],
     bold, title_font, center, left, border,
     block_intervals: Optional[Dict[str, Tuple[int,int]]] = None,
+    especial_by_block: Optional[Dict[str, Dict[str, Set[int]]]] = None,
+    especial_colors: Optional[Dict[str, str]] = None,
 ):
     subramps = sorted(cap_map.keys(), key=ramp_sort_key)
     max_pos = max(cap_map.values()) if cap_map else 14
@@ -397,6 +420,14 @@ def write_day_sheet(
                     evicted_details[sub].append(f"pos {s:02d}: {evicted_block} desplazado")
                 else:
                     slot_blocks[sub][s].add(bt)
+
+    # Build especial slot set for quick lookup when painting
+    esp_sub_slots: Dict[str, Set[int]] = defaultdict(set)
+    if especial_by_block:
+        for bt, per_sub in especial_by_block.items():
+            if not bt.startswith("_CONFLICT_"):
+                for sub, slots in per_sub.items():
+                    esp_sub_slots[sub].update(slots)
 
     # Real conflicts: slots where the assigned blocks themselves overlap in time
     conflict_slots: Dict[str, Set[int]] = defaultdict(set)
@@ -454,7 +485,11 @@ def write_day_sheet(
                 multi_details.append(f"pos {slot:02d}: CONFLICTO " + "+".join(blocks_sorted))
             elif len(blocks_sorted) == 1:
                 b = blocks_sorted[0]
-                cell.fill = PatternFill("solid", fgColor=block_colors.get(b, "FFFFFF"))
+                is_esp = slot in esp_sub_slots.get(sub, set())
+                if is_esp and especial_colors:
+                    cell.fill = PatternFill("solid", fgColor=especial_colors.get(b, _darken(block_colors.get(b, "CCCCCC"))))
+                else:
+                    cell.fill = PatternFill("solid", fgColor=block_colors.get(b, "FFFFFF"))
                 cell.value = b
             else:
                 # Multiple blocks but no timing conflict (compatible time windows)
@@ -469,9 +504,10 @@ def write_day_sheet(
             # Also paint conflict slots not yet in slot_blocks
             cell.alignment = center
             cell.border = border
-            # Smaller font for multi-block to fit in narrow columns
+            # Smaller font for multi-block; italic for especial
             n_blocks = len(blocks_here) if slot not in conflict_slots.get(sub, set()) else 2
-            cell.font = Font(bold=True, size=7 if n_blocks > 1 else 9)
+            is_esp_slot = slot in esp_sub_slots.get(sub, set())
+            cell.font = Font(bold=True, italic=is_esp_slot, size=7 if n_blocks > 1 else 9)
 
         # (evicted blocks are noted in MULTI column but don't paint cells red)
 
@@ -487,6 +523,39 @@ def write_day_sheet(
 
         ws.row_dimensions[row].height = 18
         row += 1
+
+    # ── Summary row ─────────────────────────────────────────────────────────
+    # Count total regular and especial slots across all subramps
+    especial_slots_total = 0
+    regular_slots_total  = 0
+    if especial_by_block:
+        esp_sub_slot: Dict[str, Set[int]] = defaultdict(set)
+        for bt, per_sub in especial_by_block.items():
+            if not bt.startswith("_CONFLICT_"):
+                for sub, slots in per_sub.items():
+                    esp_sub_slot[sub].update(slots)
+        especial_slots_total = sum(len(s) for s in esp_sub_slot.values())
+    reg_sub_slot: Dict[str, Set[int]] = defaultdict(set)
+    for bt, per_sub in usage_by_block.items():
+        if not bt.startswith("_CONFLICT_"):
+            for sub, slots in per_sub.items():
+                reg_sub_slot[sub].update(slots)
+    regular_slots_total = sum(len(s) for s in reg_sub_slot.values()) - especial_slots_total
+
+    # Write summary row
+    summary_label = ws.cell(row=row, column=1,
+        value=f"TOTAL: {regular_slots_total} regulares · {especial_slots_total} especiales")
+    summary_label.font = Font(bold=True, size=10)
+    summary_label.alignment = Alignment(horizontal="left", vertical="center")
+    summary_label.fill = PatternFill("solid", fgColor="D9E1F2")
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=multi_col_idx)
+    ws.row_dimensions[row].height = 18
+
+    # Update title to include totals
+    ws["A1"] = (
+        f"SORTER MAP - {day_name} (agrega {day_code}0..{day_code}5) | slots POSTEX  "
+        f"│  Regulares: {regular_slots_total}  │  Especiales: {especial_slots_total}"
+    )
 
     ws.freeze_panes = "B3"
 
@@ -510,6 +579,15 @@ def write_leyenda_sheet(ws, day_block_color_map: Dict[str, str], bold, title_fon
         c1.alignment = center
         box = ws.cell(row=r, column=2, value="")
         box.fill = PatternFill("solid", fgColor=day_block_color_map[block_token])
+        # Especial color swatch
+        day_code_l = block_token[0]
+        esp_color_map = build_especial_color_map_for_day(day_code_l)
+        esp_box = ws.cell(row=r, column=4)
+        esp_box.fill = PatternFill("solid", fgColor=esp_color_map.get(block_token, "CCCCCC"))
+        esp_box.font = Font(bold=True, italic=True, size=9)
+        esp_box.value = f"{block_token}*"
+        esp_box.alignment = center
+        esp_box.border = border
         box.border = border
         r += 1
 
@@ -665,13 +743,14 @@ def main():
 
     for day_name, day_code in DAY_SHEETS:
         day_blocks = [f"{day_code}{i}" for i in range(6)]  # D0..D5, etc
-        usage_by_block, warnings = compute_day_usage(grupo, day_blocks, block_intervals)
+        usage_by_block, warnings, especial_by_block = compute_day_usage(grupo, day_blocks, block_intervals)
         total_warnings += warnings
 
         block_colors = build_block_color_map_for_day(day_code)
         global_color_map.update(block_colors)
 
         ws = wb.create_sheet(day_name)
+        especial_colors = build_especial_color_map_for_day(day_code)
         write_day_sheet(
             ws=ws,
             day_name=day_name,
@@ -681,6 +760,8 @@ def main():
             block_colors=block_colors,
             bold=bold, title_font=title_font, center=center, left=left, border=border,
             block_intervals=block_intervals,
+            especial_by_block=especial_by_block,
+            especial_colors=especial_colors,
         )
 
     ws_leg = wb.create_sheet("LEYENDA")
