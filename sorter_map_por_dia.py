@@ -218,18 +218,19 @@ def _darken(hex_color: str, factor: float = 0.75) -> str:
     return f"{r:02X}{g:02X}{b:02X}"
 
 # Especial colors: same palette but darker
-PALETTE_ESP = [_darken(c) for c in PALETTE]
+# Especiales: amarillo fosforito fijo para máxima visibilidad
+PALETTE_ESP = ["FFFF00"] * 10  # amarillo fosforito
 
 def build_block_color_map_for_day(day_code: str) -> Dict[str, str]:
     m: Dict[str, str] = {}
-    for i in range(6):
+    for i in range(10):
         key = f"{day_code}{i}"
         m[key] = PALETTE[i % len(PALETTE)]
     return m
 
 def build_especial_color_map_for_day(day_code: str) -> Dict[str, str]:
     m: Dict[str, str] = {}
-    for i in range(6):
+    for i in range(10):
         key = f"{day_code}{i}"
         m[key] = PALETTE_ESP[i % len(PALETTE_ESP)]
     return m
@@ -286,6 +287,11 @@ def compute_day_usage(
 ) -> Tuple[Dict[str, Dict[str, Set[int]]], int]:
     warnings = 0
     especial_usage: Dict[str, Dict[str, Set[int]]] = defaultdict(lambda: defaultdict(set))
+    playa_map: Dict[str, Dict[str, Dict[int, Set[str]]]] = defaultdict(lambda: defaultdict(lambda: defaultdict(set)))
+    import re as _re_mod
+    _re_playa = _re_mod.compile(
+        r"(?:DOMINGO|LUNES|MARTES|MIERCOLES|JUEVES|VIERNES|SABADO)_"
+        r"(.+?)(?:\s*\(|\s*$)", _re_mod.IGNORECASE)
 
     desc_col = find_col(grupo_df, ["Descripción Grupos de destino", "Descripcion Grupos de destino", "DESCRIPCION GRUPOS DE DESTINO"])
     elem_col = find_col(grupo_df, ["Elemento", "ELEMENTO"])
@@ -336,11 +342,16 @@ def compute_day_usage(
                     continue
 
             usage[block_token][sub].add(slot)
+            # Track playa name for cell tooltip
+            _desc_str = str(r[desc_col])
+            _playa_m = _re_playa.search(_desc_str)
+            if _playa_m:
+                playa_map[block_token][sub][slot].add(_playa_m.group(1).strip())
             # Track if this entry is an especial
-            if 'ESPECIAL' in str(r[desc_col]).upper():
+            if 'ESPECIAL' in _desc_str.upper():
                 especial_usage[block_token][sub].add(slot)
 
-    return usage, warnings, especial_usage
+    return usage, warnings, especial_usage, playa_map
 
 
 # -----------------------------
@@ -371,6 +382,7 @@ def write_day_sheet(
     block_intervals: Optional[Dict[str, Tuple[int,int]]] = None,
     especial_by_block: Optional[Dict[str, Dict[str, Set[int]]]] = None,
     especial_colors: Optional[Dict[str, str]] = None,
+    playa_by_block: Optional[Dict[str, Dict[str, Dict[int, Set[str]]]]] = None,
 ):
     subramps = sorted(cap_map.keys(), key=ramp_sort_key)
     max_pos = max(cap_map.values()) if cap_map else 14
@@ -428,6 +440,15 @@ def write_day_sheet(
             if not bt.startswith("_CONFLICT_"):
                 for sub, slots in per_sub.items():
                     esp_sub_slots[sub].update(slots)
+
+    # Build slot→playa lookup for tooltips
+    slot_playas: Dict[str, Dict[int, Set[str]]] = defaultdict(lambda: defaultdict(set))
+    if playa_by_block:
+        for bt, per_sub in playa_by_block.items():
+            if not bt.startswith("_CONFLICT_"):
+                for sub, slot_map in per_sub.items():
+                    for s, playas in slot_map.items():
+                        slot_playas[sub][s].update(playas)
 
     # Real conflicts: slots where the assigned blocks themselves overlap in time
     conflict_slots: Dict[str, Set[int]] = defaultdict(set)
@@ -493,7 +514,9 @@ def write_day_sheet(
                 cell.value = b
             else:
                 # Multiple blocks but no timing conflict (compatible time windows)
-                cell.fill = PatternFill("solid", fgColor="BFBFBF")
+                # Yellow if any block in this slot is an especial
+                has_esp = slot in esp_sub_slots.get(sub, set())
+                cell.fill = PatternFill("solid", fgColor="FFFF00" if has_esp else "BFBFBF")
                 # Short label: first block + "+N" if more than 2, full name if 2
                 if len(blocks_sorted) == 2:
                     cell.value = blocks_sorted[0] + "+" + blocks_sorted[1]
@@ -508,6 +531,10 @@ def write_day_sheet(
             n_blocks = len(blocks_here) if slot not in conflict_slots.get(sub, set()) else 2
             is_esp_slot = slot in esp_sub_slots.get(sub, set())
             cell.font = Font(bold=True, italic=is_esp_slot, size=7 if n_blocks > 1 else 9)
+            # Tooltip: playa name(s)
+            playas_here = slot_playas.get(sub, {}).get(slot, set())
+            if playas_here:
+                cell.comment = Comment("\n".join(sorted(playas_here)), "SorterMap")
 
         # (evicted blocks are noted in MULTI column but don't paint cells red)
 
@@ -742,8 +769,14 @@ def main():
     block_intervals = build_block_intervals(bloques)
 
     for day_name, day_code in DAY_SHEETS:
-        day_blocks = [f"{day_code}{i}" for i in range(6)]  # D0..D5, etc
-        usage_by_block, warnings, especial_by_block = compute_day_usage(grupo, day_blocks, block_intervals)
+        # Detect max block index from block_intervals for this day_code
+        max_idx = 9  # generous upper bound; no harm if no entries exist for high indices
+        day_blocks = [f"{day_code}{i}" for i in range(max_idx + 1) 
+                      if block_intervals is None or f"{day_code}{i}" in block_intervals 
+                      or any(f"BLO{day_code}{i}" in k for k in (block_intervals or {}))]
+        if not day_blocks:  # fallback
+            day_blocks = [f"{day_code}{i}" for i in range(7)]
+        usage_by_block, warnings, especial_by_block, playa_by_block = compute_day_usage(grupo, day_blocks, block_intervals)
         total_warnings += warnings
 
         block_colors = build_block_color_map_for_day(day_code)
@@ -762,13 +795,14 @@ def main():
             block_intervals=block_intervals,
             especial_by_block=especial_by_block,
             especial_colors=especial_colors,
+            playa_by_block=playa_by_block,
         )
 
     ws_leg = wb.create_sheet("LEYENDA")
     write_leyenda_sheet(ws_leg, global_color_map, bold, title_font, center, border)
 
     ws_tbl = wb.create_sheet("BLOQUES_DESTINOS")
-    all_block_tokens = [f"{code}{i}" for _, code in DAY_SHEETS for i in range(6)]
+    all_block_tokens = [f"{code}{i}" for _, code in DAY_SHEETS for i in range(10)]
     warnings_tbl = write_bloques_destinos_sheet(
         ws=ws_tbl,
         grupo_df=grupo,
