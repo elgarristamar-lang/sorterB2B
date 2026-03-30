@@ -459,13 +459,19 @@ def write_day_sheet(
             else:
                 # Multiple blocks but no timing conflict (compatible time windows)
                 cell.fill = PatternFill("solid", fgColor="BFBFBF")
-                cell.value = "+".join(blocks_sorted)
+                # Short label: first block + "+N" if more than 2, full name if 2
+                if len(blocks_sorted) == 2:
+                    cell.value = blocks_sorted[0] + "+" + blocks_sorted[1]
+                else:
+                    cell.value = blocks_sorted[0] + f"+{len(blocks_sorted)-1}"
                 multi_details.append(f"pos {slot:02d}: " + "+".join(blocks_sorted))
 
             # Also paint conflict slots not yet in slot_blocks
             cell.alignment = center
             cell.border = border
-            cell.font = Font(bold=True, size=9)
+            # Smaller font for multi-block to fit in narrow columns
+            n_blocks = len(blocks_here) if slot not in conflict_slots.get(sub, set()) else 2
+            cell.font = Font(bold=True, size=7 if n_blocks > 1 else 9)
 
         # (evicted blocks are noted in MULTI column but don't paint cells red)
 
