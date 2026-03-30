@@ -388,17 +388,17 @@ def find_free_slots(occ, capacity, n_needed, preferred_rampas=None, committed_gr
         in_group = (committed_group is None or grp == committed_group)
         proximity = _ramp_proximity_key(rampa, _anchor) if _anchor else _ramp_number(rampa)
         # Empty rampas WITH anchor: use real proximity (prefer close empty rampas)
-        # Empty rampas WITHOUT anchor: proximity=0 → sort by combined capacity
-        # Non-empty rampas: use real proximity
+        # Empty rampas WITHOUT anchor: sort by rampa number (lowest first = closest to core)
+        # Non-empty rampas: always worse than empty
         if is_empty and _anchor:
-            effective_prox = proximity  # closest empty rampa to existing assignments
+            effective_prox = proximity      # closest empty rampa to existing anchor
         elif is_empty:
-            effective_prox = 0          # no anchor → all empty equal, sort by capacity
+            effective_prox = _ramp_number(rampa)  # no anchor → prefer lower numbers
         else:
-            effective_prox = proximity + 1  # non-empty: always worse than any empty
+            effective_prox = 1000 + proximity   # non-empty: always after all empty rampas
         return (
             -int(in_group),          # committed group first
-            effective_prox,          # empty rampas preferred (0 or real dist)
+            effective_prox,          # empty preferred, low-number preferred when no anchor
             -int(mate_free_n > 0),   # pair-mate available
             -combined,               # most combined free
             -len(free),
