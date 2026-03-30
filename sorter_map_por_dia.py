@@ -348,7 +348,7 @@ def compute_day_usage(
             if _playa_m:
                 playa_map[block_token][sub][slot].add(_playa_m.group(1).strip())
             # Track if this entry is an especial
-            if 'ESPECIAL' in _desc_str.upper():
+            if '(ESPECIAL' in _desc_str.upper() or _desc_str.upper().endswith(' ESPECIAL'):
                 especial_usage[block_token][sub].add(slot)
 
     return usage, warnings, especial_usage, playa_map
@@ -371,6 +371,50 @@ def make_styles():
 # -----------------------------
 # Day sheet writer (UPDATED)
 # -----------------------------
+
+def _write_playas_por_rampa(ws, all_playa_data, bold, border):
+    """Sheet filtrable: día, subrampa, posición, bloque(s), playa(s)."""
+    from openpyxl.styles import PatternFill as _PF, Font as _Font, Alignment as _Aln
+    from openpyxl.worksheet.table import Table, TableStyleInfo
+    from openpyxl.utils import get_column_letter
+
+    HEAD_FILL = _PF("solid", fgColor="1F3864")
+    HEAD_FONT = _Font(bold=True, color="FFFFFF", size=10)
+    center    = _Aln(horizontal="center", vertical="center")
+    left      = _Aln(horizontal="left",   vertical="center")
+
+    headers = ["DÍA", "SUBRAMPA", "POS", "BLOQUE(S)", "AGRUPACIÓN PLAYA", "ESPECIAL"]
+    widths  = [12,    11,         6,     14,           50,                  10]
+    for ci, (h, w) in enumerate(zip(headers, widths), 1):
+        c = ws.cell(row=1, column=ci, value=h)
+        c.fill = HEAD_FILL; c.font = HEAD_FONT
+        c.alignment = center; c.border = border
+        ws.column_dimensions[get_column_letter(ci)].width = w
+    ws.row_dimensions[1].height = 18
+
+    row = 2
+    for day_name, sub, slot, blocks_str, playas_str, is_esp in all_playa_data:
+        vals = [day_name, sub, slot, blocks_str, playas_str, "SÍ" if is_esp else ""]
+        alns = [center, center, center, center, left, center]
+        for ci, (v, aln) in enumerate(zip(vals, alns), 1):
+            c = ws.cell(row=row, column=ci, value=v)
+            c.border = border; c.alignment = aln
+            if is_esp:
+                c.fill = _PF("solid", fgColor="FFFF00")
+        row += 1
+
+    if row > 2:
+        tab = Table(displayName="PlayasPorRampa",
+                    ref=f"A1:{get_column_letter(len(headers))}{row-1}")
+        tab.tableStyleInfo = TableStyleInfo(
+            name="TableStyleMedium9", showFirstColumn=False,
+            showLastColumn=False, showRowStripes=True, showColumnStripes=False)
+        ws.add_table(tab)
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{row-1}"
+
+
 def write_day_sheet(
     ws,
     day_name: str,
@@ -532,9 +576,18 @@ def write_day_sheet(
             is_esp_slot = slot in esp_sub_slots.get(sub, set())
             cell.font = Font(bold=True, italic=is_esp_slot, size=7 if n_blocks > 1 else 9)
             # Tooltip: playa name(s)
-            playas_here = slot_playas.get(sub, {}).get(slot, set())
-            if playas_here:
-                cell.comment = Comment("\n".join(sorted(playas_here)), "SorterMap")
+            # Build tooltip: "BLOCK: PLAYA_NAME [ESPECIAL]" per block occupying this slot
+            tooltip_lines = []
+            if playa_by_block:
+                for bt, sub_map in sorted(playa_by_block.items()):
+                    if bt.startswith("_CONFLICT_"): continue
+                    slot_playas_bt = sub_map.get(sub, {}).get(slot, set())
+                    for playa in sorted(slot_playas_bt):
+                        is_esp_playa = slot in especial_by_block.get(bt, {}).get(sub, set()) if especial_by_block else False
+                        label = f"{bt}: {playa}" + (" ★" if is_esp_playa else "")
+                        tooltip_lines.append(label)
+            if tooltip_lines:
+                cell.comment = Comment("\n".join(tooltip_lines), "SorterMap")
 
         # (evicted blocks are noted in MULTI column but don't paint cells red)
 
@@ -1117,6 +1170,7 @@ def main():
 
     block_intervals = build_block_intervals(bloques)
 
+    all_playa_data = []
     for day_name, day_code in DAY_SHEETS:
         # Detect max block index from block_intervals for this day_code
         max_idx = 9  # generous upper bound; no harm if no entries exist for high indices
@@ -1146,6 +1200,39 @@ def main():
             especial_colors=especial_colors,
             playa_by_block=playa_by_block,
         )
+
+        # Collect data for PLAYAS_POR_RAMPA sheet
+        if playa_by_block:
+            from collections import defaultdict as _dd2
+            _esp_sub: dict = _dd2(set)
+            if especial_by_block:
+                for _bt, _ps in especial_by_block.items():
+                    if not _bt.startswith("_CONFLICT_"):
+                        for _s, _slots in _ps.items():
+                            _esp_sub[_s].update(_slots)
+            # slot_blocks: (sub, slot) → set of block tokens
+            _sb: dict = _dd2(set)
+            for _bt, _ps in usage_by_block.items():
+                if not _bt.startswith("_CONFLICT_"):
+                    for _sub, _slots in _ps.items():
+                        for _sl in _slots:
+                            _sb[(_sub, _sl)].add(_bt)
+            for (_sub, _sl), _blqs in sorted(_sb.items(),
+                    key=lambda x: (ramp_sort_key(x[0][0]), x[0][1])):
+                _playas = set()
+                for _bt, _sub_map in playa_by_block.items():
+                    if not _bt.startswith("_CONFLICT_") and _sl in _sub_map.get(_sub, {}):
+                        _playas.update(_sub_map[_sub][_sl])
+                _is_esp = _sl in _esp_sub.get(_sub, set())
+                all_playa_data.append((
+                    day_name, _sub, _sl,
+                    "+".join(sorted(_blqs)),
+                    " | ".join(sorted(_playas)) if _playas else "",
+                    _is_esp,
+                ))
+
+    ws_ppr = wb.create_sheet("PLAYAS_POR_RAMPA")
+    _write_playas_por_rampa(ws_ppr, all_playa_data, bold, border)
 
     ws_leg = wb.create_sheet("LEYENDA")
     write_leyenda_sheet(ws_leg, global_color_map, bold, title_font, center, border)
