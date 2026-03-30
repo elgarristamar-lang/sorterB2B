@@ -35,6 +35,10 @@ f_bloques = st.file_uploader(
     "Bloques horarios *(necesario para Gantt y Sorter Map)*", type=["xlsx"],
     help="Columnas: NUEVO BLOQUE · Día LIBERACIÓN · Hora LIBERACIÓN · Día DESACTIVACIÓN · Hora DESACTIVACIÓN")
 
+f_superplaya = st.file_uploader(
+    "Superplayas *(opcional — mejora la agrupación de rampas)*", type=["xlsx"],
+    help="Columnas: AGRUPACION_PLAYA · SUPERPLAYA — define qué destinos deben ir juntos en rampas contiguas")
+
 st.divider()
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -43,10 +47,11 @@ ALL_DAYS = ["DOMINGO","LUNES","MARTES","MIERCOLES","JUEVES","VIERNES","SABADO"]
 def save_uploads(tmp: Path):
     p = {}
     for key, f, name in [
-        ("parrilla", f_parrilla, "parrilla.xlsx"),
-        ("gd",       f_gd,       "gd.xlsx"),
-        ("cap",      f_cap,       "cap.csv"),
-        ("bloques",  f_bloques,   "bloques.xlsx"),
+        ("parrilla",    f_parrilla,    "parrilla.xlsx"),
+        ("gd",          f_gd,          "gd.xlsx"),
+        ("cap",         f_cap,          "cap.csv"),
+        ("bloques",     f_bloques,      "bloques.xlsx"),
+        ("superplaya",  f_superplaya,   "superplaya.xlsx"),
     ]:
         if f:
             path = tmp / name
@@ -61,8 +66,9 @@ def run_gd(p, tmp, sc, days_arg=""):
     cmd  = [sys.executable, str(BASE_DIR / "process_parrilla.py"),
             str(p["parrilla"]), str(p["gd"]), str(p["cap"]),
             sheet.strip(), sc, str(gd), str(html)]
-    if days_arg:
-        cmd.append(days_arg)
+    cmd.append(days_arg)  # argv[8] — always pass (empty string = no filter)
+    if "superplaya" in p:
+        cmd.append(str(p["superplaya"]))  # argv[9]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     return gd, html, r
 
