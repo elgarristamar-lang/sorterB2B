@@ -515,7 +515,42 @@ def assign_especial(orig_dia, orig_playa, new_dia, raw_bloque, id_cluster,
 
 # ─── PROCESS ──────────────────────────────────────────────────────────────────
 
-def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, filter_days=None, superplaya_map=None):
+
+def load_especial_bloque_map(parrilla_path):
+    """
+    Read the 'SEMANA SANTA W*' sheet from the parrilla workbook.
+    Returns {(dia_new, playa): bloque} for all especiales with a valid BLOQUE.
+    This is the authoritative source for which bloque to assign to each especial.
+    """
+    from openpyxl import load_workbook as _lw
+    import re as _re
+    result = {}
+    try:
+        wb = _lw(str(parrilla_path), read_only=True)
+        # Find the SEMANA SANTA sheet
+        sheet = next((s for s in wb.sheetnames 
+                      if 'SEMANA SANTA' in s.upper() or 'SEMANA_SANTA' in s.upper()), None)
+        if not sheet:
+            return result
+        ws = wb[sheet]
+        rows = list(ws.iter_rows(values_only=True))
+        col = {str(h): i for i, h in enumerate(rows[0]) if h}
+        for r in rows[1:]:
+            bloque = r[col.get('BLOQUE', -1)] if 'BLOQUE' in col else None
+            if not bloque or str(bloque) in ('None', '#N/A', 'NO_BLOQUE'): continue
+            dia_new = str(r[col.get('DIA_SALIDA_NEW', 3)] or '')
+            playa_field = str(r[col.get('DIA_PLAYA_NEW', 5)] or '')
+            tipo = str(r[col.get('TIPO_SALIDA', 22)] or '')
+            if 'CANCELADA' in tipo: continue
+            # Extract playa from "LUNES_ESPANA_GUARROMAN" → "ESPANA_GUARROMAN"
+            m = _re.match(r'^(?:DOMINGO|LUNES|MARTES|MIERCOLES|JUEVES|VIERNES|SABADO)_(.+)', playa_field)
+            if m and dia_new:
+                result[(dia_new.upper(), m.group(1))] = str(bloque)
+    except Exception as e:
+        print(f"Warning: could not load especial bloque map: {e}")
+    return result
+
+def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, filter_days=None, superplaya_map=None, especial_bloque_map=None):
     canceladas, especiales, habituales = {}, {}, {}
 
     for r in parrilla_records:
@@ -597,9 +632,14 @@ def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, fi
                 for r in capacity if r not in EXCLUDED_RAMPAS and _ramp_number(r) % 2 != 0)
             cg = 'par' if par_free_n >= imp_free_n else 'impar'
 
+        # Resolve correct bloque: parrilla BLOQUE if set, else SEMANA SANTA map, else auto-resolve
+        _raw_bloque = record.get('bloque', '')
+        _is_na = not _raw_bloque or str(_raw_bloque).strip().upper() in ('#N/A','N/A','NONE','NO_BLOQUE','')
+        if _is_na and especial_bloque_map:
+            _raw_bloque = especial_bloque_map.get((dia_new.upper(), playa), _raw_bloque)
         new_rows, info = assign_especial(
             dia_orig, playa, dia_new,
-            record['bloque'], record['id_cluster'],
+            _raw_bloque, record['id_cluster'],
             by_dia_playa, tagged, capacity, bloque_timings,
             freed_per_day.get(dia_new, set()),
             run_occ.get(dia_new, {}),
@@ -1013,7 +1053,10 @@ def main():
     superplaya_map  = load_superplaya(superplaya_path)
     if superplaya_map:
         print(f"  Superplayas cargadas: {len(set(superplaya_map.values()))} grupos")
-    output_rows, summary = process(parrilla, tagged, by_dia_playa, capacity, bloque_timings, filter_days, superplaya_map)
+    especial_bloque_map = load_especial_bloque_map(parrilla_path)
+    if especial_bloque_map:
+        print(f"  Bloque map (SEMANA SANTA): {len(especial_bloque_map)} entradas")
+    output_rows, summary = process(parrilla, tagged, by_dia_playa, capacity, bloque_timings, filter_days, superplaya_map, especial_bloque_map)
 
     ok      = [r for r in summary['assignment_results'] if r['status'] == 'OK']
     partial = [r for r in summary['assignment_results'] if r['status'] == 'PARTIAL']
