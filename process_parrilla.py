@@ -286,7 +286,26 @@ def lexical_prefix(playa: str) -> str:
             break
     return p
 
-def find_free_slots(occ, capacity, n_needed, preferred_rampas=None):
+
+def _ramp_number(r: str) -> int:
+    """Extract numeric part: R11C → 11"""
+    import re as _re
+    m = _re.match(r'^R(\d+)', r)
+    return int(m.group(1)) if m else 99
+
+def _ramp_group(r: str) -> str:
+    """'par' if RXX is even, 'impar' if odd"""
+    n = _ramp_number(r)
+    return 'par' if n % 2 == 0 else 'impar'
+
+def _ramp_proximity_key(r: str, anchor_numbers: set) -> int:
+    """Distance to nearest already-used rampa number in the superplaya."""
+    n = _ramp_number(r)
+    if not anchor_numbers:
+        return n  # no anchor yet → sort by number
+    return min(abs(n - a) for a in anchor_numbers)
+
+def find_free_slots(occ, capacity, n_needed, preferred_rampas=None, committed_group=None, anchor_numbers=None):
     """Find n_needed free slots. If preferred_rampas given, try those first (sibling proximity)."""
     all_rampas = sorted(capacity.keys(), key=lambda r: (int(r[1:-1]), r[-1]))
     
@@ -349,22 +368,32 @@ def find_free_slots(occ, capacity, n_needed, preferred_rampas=None):
         free = get_free(rampa)
         if free:
             rampa_free.append((rampa, free, len(occ.get(rampa, {})) == 0))
-    # Sort: complete-pair first (both A+B or C+D free), then empty, then most-free
+    # Sort: committed group first + proximity, then pair-mate, then general
     def _pair_mate_of(r):
         last = r[-1] if r else ''
         m = {'A':'B','B':'A','C':'D','D':'C'}.get(last)
         return r[:-1]+m if m else None
+
+    _anchor = anchor_numbers or set()
 
     def _sort_key(x):
         rampa, free, is_empty = x
         mate = _pair_mate_of(rampa)
         mate_free_n = 0
         if mate and mate not in EXCLUDED_RAMPAS:
-            mate_slots = get_free(mate)
-            mate_free_n = len(mate_slots)
-        # combined free slots with pair-mate
+            mate_free_n = len(get_free(mate))
         combined = len(free) + mate_free_n
-        return (-int(mate_free_n > 0), -combined, -int(is_empty), -len(free))
+        grp = _ramp_group(rampa)
+        in_group = (committed_group is None or grp == committed_group)
+        proximity = _ramp_proximity_key(rampa, _anchor) if _anchor else _ramp_number(rampa)
+        return (
+            -int(in_group),          # committed group first
+            proximity,               # closest to existing assignments
+            -int(mate_free_n > 0),   # pair-mate available
+            -combined,               # most combined free
+            -int(is_empty),
+            -len(free),
+        )
     rampa_free.sort(key=_sort_key)
     for rampa, free, _ in rampa_free:
         if rem <= 0: break
@@ -425,7 +454,8 @@ def get_slot_structure(postex_entries, sorexp_entries):
 
 def assign_especial(orig_dia, orig_playa, new_dia, raw_bloque, id_cluster,
                     by_dia_playa, tagged, capacity, bloque_timings, freed_in_new_dia,
-                    run_occ_new_dia=None, preferred_rampas=None, all_especial_playas=None):
+                    run_occ_new_dia=None, preferred_rampas=None, all_especial_playas=None,
+                    committed_group=None, anchor_numbers=None):
     """
     Assign slots from (orig_dia, orig_playa) to free sorter positions in new_dia,
     respecting bloque timing and preserving the slot→destinos structure.
@@ -471,7 +501,7 @@ def assign_especial(orig_dia, orig_playa, new_dia, raw_bloque, id_cluster,
     freed    = (all_especial_playas or set()) | freed_in_new_dia
     occ      = build_day_occ(tagged, new_dia, new_bloque, bloque_timings,
                              exclude_playas=freed, run_occ=run_occ_new_dia)
-    assigned, unmet = find_free_slots(occ, capacity, n_slots, preferred_rampas=preferred_rampas)
+    assigned, unmet = find_free_slots(occ, capacity, n_slots, preferred_rampas=preferred_rampas, committed_group=committed_group, anchor_numbers=anchor_numbers)
 
     playa_tag = orig_playa.replace('ESPANA_','')[:6].replace('_','')
     new_grupo = f"ESP_{new_dia[:3]}_{playa_tag}"[:18]
@@ -546,7 +576,9 @@ def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, fi
 
     results, added = [], 0
     especial_rows = []
-    _last_rampas_by_prefix = {}  # (dia_new, prefix) → set of rampas used by last sibling
+    _last_rampas_by_prefix = {}   # (dia_new, prefix) → set of rampas used by last sibling
+    _committed_group = {}         # (dia_new, prefix) → 'par' or 'impar'
+    _anchor_numbers  = {}         # (dia_new, prefix) → set of rampa numbers used so far
     all_esp_playas = {playa for (_, playa) in especiales}  # all playas being moved (any day)
     # Sort especiales so same-family playas (shared lexical prefix) are consecutive
     # This lets siblings share rampas naturally via run_occ
@@ -563,6 +595,24 @@ def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, fi
         prefix = (superplaya_map or {}).get(playa.upper(), lexical_prefix(playa))
         pref_rampas = _last_rampas_by_prefix.get((dia_new, prefix))
 
+        cg  = _committed_group.get((dia_new, prefix))
+        an  = _anchor_numbers.get((dia_new, prefix))
+
+        # If no committed group yet, pre-select the group with most available slots
+        if cg is None:
+            occ_snap = build_day_occ(
+                tagged, dia_new, 
+                resolve_bloque_for_new_day(record.get('id_cluster',''), dia_new, bloque_timings) or '',
+                bloque_timings, exclude_playas=all_esp_playas,
+                run_occ=run_occ.get(dia_new, {}))
+            par_free_n = sum(
+                len([p for p in range(1, capacity.get(r,0)+1) if p not in occ_snap.get(r,{})])
+                for r in capacity if r not in EXCLUDED_RAMPAS and _ramp_number(r) % 2 == 0)
+            imp_free_n = sum(
+                len([p for p in range(1, capacity.get(r,0)+1) if p not in occ_snap.get(r,{})])
+                for r in capacity if r not in EXCLUDED_RAMPAS and _ramp_number(r) % 2 != 0)
+            cg = 'par' if par_free_n >= imp_free_n else 'impar'
+
         new_rows, info = assign_especial(
             dia_orig, playa, dia_new,
             record['bloque'], record['id_cluster'],
@@ -571,10 +621,21 @@ def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, fi
             run_occ.get(dia_new, {}),
             preferred_rampas=pref_rampas,
             all_especial_playas=all_esp_playas,
+            committed_group=cg,
+            anchor_numbers=an,
         )
         # Update sibling proximity tracking
         if info.get('status') == 'OK' and info.get('rampas'):
-            _last_rampas_by_prefix[(dia_new, prefix)] = set(info['rampas'].keys())
+            used_rampas = set(info['rampas'].keys())
+            _last_rampas_by_prefix[(dia_new, prefix)] = used_rampas
+            # Determine/lock committed group (majority vote on first assignment)
+            if (dia_new, prefix) not in _committed_group:
+                par_count   = sum(1 for r in used_rampas if _ramp_group(r) == 'par')
+                impar_count = len(used_rampas) - par_count
+                _committed_group[(dia_new, prefix)] = 'par' if par_count >= impar_count else 'impar'
+            # Update anchor numbers
+            existing = _anchor_numbers.get((dia_new, prefix), set())
+            _anchor_numbers[(dia_new, prefix)] = existing | {_ramp_number(r) for r in used_rampas}
 
         # Register newly assigned positions so next playa in same run sees them
         for row in new_rows:
