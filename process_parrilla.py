@@ -306,109 +306,75 @@ def _ramp_proximity_key(r: str, anchor_numbers: set) -> int:
         return n  # no anchor yet → sort by number
     return min(abs(n - a) for a in anchor_numbers)
 
-def find_free_slots(occ, capacity, n_needed, preferred_rampas=None, committed_group=None, anchor_numbers=None):
-    """Find n_needed free slots. If preferred_rampas given, try those first (sibling proximity)."""
-    all_rampas = sorted(capacity.keys(), key=lambda r: (int(r[1:-1]), r[-1]))
-    
-    def get_free(rampa):
-        if rampa in EXCLUDED_RAMPAS: return []
-        cap = capacity.get(rampa, 0)
-        used = set(occ.get(rampa, {}).keys())
-        return sorted(p for p in range(1, cap+1) if p not in used)
+def find_free_slots(occ, capacity, n_needed,
+                    preferred_rampas=None, committed_group=None, anchor_numbers=None):
+    """
+    Asigna n_needed slots libres siguiendo esta prioridad:
+
+    1. RAMPAS HERMANAS  — mismas rampas que usó el último miembro de la superplaya
+    2. PAR-PAREJA       — A↔B o C↔D de las rampas hermanas (mismo par físico)
+    3. POOL GENERAL     — ordenado por:
+         a. Grupo (par/impar) comprometido para la superplaya
+         b. Rampas VACÍAS primero (sin bloques solapantes del GD estándar)
+            - Con anchor: las más cercanas numéricamente al anchor
+            - Sin anchor: las de número más bajo (rampas "del centro")
+         c. Rampas con par-pareja también libre (mejor para la siguiente playa)
+         d. Más slots libres en total (rampa + pareja)
+    """
+    def get_free(r):
+        if r in EXCLUDED_RAMPAS: return []
+        used = set(occ.get(r, {}).keys())
+        return sorted(p for p in range(1, capacity.get(r, 0) + 1) if p not in used)
+
+    def pair_of(r):
+        m = {'A':'B','B':'A','C':'D','D':'C'}.get(r[-1] if r else '')
+        return r[:-1] + m if m else None
 
     assigned, rem = [], n_needed
 
-    # Pass 1: preferred rampas (siblings already placed nearby)
-    if preferred_rampas:
-        for rampa in sorted(preferred_rampas, key=lambda r: (int(r[1:-1]), r[-1])):
-            if rem <= 0: break
-            free = get_free(rampa)
-            if free:
-                take = free[:rem]
-                assigned.extend((rampa, p) for p in take)
-                rem -= len(take)
-
-    if rem <= 0:
-        return assigned, rem
-
-    # Compute pair-mates of preferred rampas — try these next before general pool
-    def _pair_mate(r):
-        if not r or len(r) < 2: return None
-        last = r[-1]
-        if last == 'A': return r[:-1] + 'B'
-        if last == 'B': return r[:-1] + 'A'
-        if last == 'C': return r[:-1] + 'D'
-        if last == 'D': return r[:-1] + 'C'
-        return None
-
-    pair_rampas = set()
-    if preferred_rampas:
-        for r in preferred_rampas:
-            pm = _pair_mate(r)
-            if pm and pm not in preferred_rampas:
-                pair_rampas.add(pm)
-
-    # Pass 1.5: pair-mate rampas (same pair as siblings)
-    for rampa in sorted(pair_rampas, key=lambda r: (int(r[1:-1]), r[-1])):
+    # Paso 1: rampas hermanas (mismo grupo, ya usadas por sibling anterior)
+    filtered_pref = [r for r in (preferred_rampas or [])
+                     if committed_group is None or _ramp_group(r) == committed_group]
+    for r in sorted(filtered_pref, key=_ramp_number):
         if rem <= 0: break
-        free = get_free(rampa)
+        free = get_free(r)
         if free:
-            take = free[:rem]
-            assigned.extend((rampa, p) for p in take)
-            rem -= len(take)
+            assigned.extend((r, p) for p in free[:rem]); rem -= len(free[:rem])
+
+    # Paso 2: par-pareja de las hermanas
+    pair_pool = {pair_of(r) for r in filtered_pref if pair_of(r) and pair_of(r) not in filtered_pref
+                 and (committed_group is None or _ramp_group(pair_of(r)) == committed_group)}
+    for r in sorted(pair_pool, key=_ramp_number):
+        if rem <= 0: break
+        free = get_free(r)
+        if free:
+            assigned.extend((r, p) for p in free[:rem]); rem -= len(free[:rem])
 
     if rem <= 0:
         return assigned, rem
 
-    # Pass 2: general pool (empty rampas first, then most-free)
-    already_tried = (preferred_rampas or set()) | pair_rampas
-    rampa_free = []
-    for rampa in all_rampas:
-        if rampa in EXCLUDED_RAMPAS: continue
-        if rampa in already_tried: continue
-        free = get_free(rampa)
-        if free:
-            rampa_free.append((rampa, free, len(occ.get(rampa, {})) == 0))
-    # Sort: committed group first + proximity, then pair-mate, then general
-    def _pair_mate_of(r):
-        last = r[-1] if r else ''
-        m = {'A':'B','B':'A','C':'D','D':'C'}.get(last)
-        return r[:-1]+m if m else None
-
+    # Paso 3: pool general ordenado
+    tried = (set(preferred_rampas or [])) | pair_pool
     _anchor = anchor_numbers or set()
 
-    def _sort_key(x):
-        rampa, free, is_empty = x
-        mate = _pair_mate_of(rampa)
-        mate_free_n = 0
-        if mate and mate not in EXCLUDED_RAMPAS:
-            mate_free_n = len(get_free(mate))
-        combined = len(free) + mate_free_n
-        grp = _ramp_group(rampa)
-        in_group = (committed_group is None or grp == committed_group)
-        proximity = _ramp_proximity_key(rampa, _anchor) if _anchor else _ramp_number(rampa)
-        # Empty rampas WITH anchor: use real proximity (prefer close empty rampas)
-        # Empty rampas WITHOUT anchor: sort by rampa number (lowest first = closest to core)
-        # Non-empty rampas: always worse than empty
-        if is_empty and _anchor:
-            effective_prox = proximity      # closest empty rampa to existing anchor
-        elif is_empty:
-            effective_prox = _ramp_number(rampa)  # no anchor → prefer lower numbers
-        else:
-            effective_prox = 1000 + proximity   # non-empty: always after all empty rampas
-        return (
-            -int(in_group),          # committed group first
-            effective_prox,          # empty preferred, low-number preferred when no anchor
-            -int(mate_free_n > 0),   # pair-mate available
-            -combined,               # most combined free
-            -len(free),
-        )
-    rampa_free.sort(key=_sort_key)
-    for rampa, free, _ in rampa_free:
+    def sort_key(r):
+        free = get_free(r)
+        if not free: return (999,) * 5
+        is_empty   = len(occ.get(r, {})) == 0
+        in_group   = committed_group is None or _ramp_group(r) == committed_group
+        prox       = _ramp_proximity_key(r, _anchor) if _anchor else _ramp_number(r)
+        mate       = pair_of(r)
+        mate_free  = len(get_free(mate)) if mate and mate not in EXCLUDED_RAMPAS else 0
+        # Vacía+anchor→proximidad real; vacía sin anchor→número bajo; no vacía→peor
+        eff_prox   = prox if (is_empty and _anchor) else (_ramp_number(r) if is_empty else 1000 + prox)
+        return (-int(in_group), eff_prox, -int(mate_free > 0), -(len(free) + mate_free))
+
+    pool = sorted([r for r in capacity if r not in EXCLUDED_RAMPAS and r not in tried
+                   and get_free(r)], key=sort_key)
+    for r in pool:
         if rem <= 0: break
-        take = free[:rem]
-        assigned.extend((rampa, p) for p in take)
-        rem -= len(take)
+        free = get_free(r)
+        assigned.extend((r, p) for p in free[:rem]); rem -= len(free[:rem])
 
     return assigned, rem
 
