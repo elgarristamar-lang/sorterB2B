@@ -235,18 +235,23 @@ def build_day_occ(tagged, dia, new_bloque, bloque_timings,
                    exclude_playas=None, run_occ=None):
     """
     Build {rampa: {pos: grupo}} for dia, merging:
-    - positions from tagged GD (timing-filtered)
+    - positions from tagged GD that overlap in time with new_bloque
+      (regardless of which day the entry is tagged to)
     - positions already assigned in this run (run_occ) — always conflicting
     """
     ex = exclude_playas or set()
     occ = defaultdict(dict)
     for e in tagged:
-        if e['tipo_zona'] != 'POSTEX' or e['dia'] != dia: continue
+        if e['tipo_zona'] != 'POSTEX': continue
         if e['playa'] in ex or not e['is_sorter']: continue
         existing_bloque = e['bloque'] or ''
+        # Skip if timing is known and does NOT overlap with new_bloque
         if new_bloque and existing_bloque and new_bloque in bloque_timings and existing_bloque in bloque_timings:
             if not bloques_overlap(new_bloque, existing_bloque, bloque_timings):
                 continue
+        # If no timing info available, only include entries from the same day (conservative)
+        elif e['dia'] != dia:
+            continue
         r, p = parse_rampa(e['elemento'])
         if r and p:
             occ[r][p] = e['grupo']
@@ -256,24 +261,71 @@ def build_day_occ(tagged, dia, new_bloque, bloque_timings,
             occ[rampa][pos] = grupo
     return occ
 
-def find_free_slots(occ, capacity, n_needed):
+
+
+def load_superplaya(path) -> dict:
+    """Load superplaya.xlsx → {playa: superplaya_group}"""
+    if not path or not os.path.exists(str(path)):
+        return {}
+    from openpyxl import load_workbook as _lwb
+    wb = _lwb(str(path), read_only=True)
+    ws = wb.active
+    mapping = {}
+    for row in ws.iter_rows(values_only=True):
+        if row[0] and row[1] and str(row[0]).strip() != 'AGRUPACION_PLAYA':
+            mapping[str(row[0]).strip().upper()] = str(row[1]).strip().upper()
+    return mapping
+
+def lexical_prefix(playa: str) -> str:
+    """Extract family prefix: ESPANA_LEGANES_EXT → ESPANA_LEGANES"""
+    p = playa.upper()
+    p = re.sub(r'_\d+$', '', p)
+    for sfx in ['_TSA_EXT','_TSA','_EXT','_CPT_OL','_CPT','_AIR','_OL','_CIP']:
+        if p.endswith(sfx):
+            p = p[:-len(sfx)]
+            break
+    return p
+
+def find_free_slots(occ, capacity, n_needed, preferred_rampas=None):
+    """Find n_needed free slots. If preferred_rampas given, try those first (sibling proximity)."""
     all_rampas = sorted(capacity.keys(), key=lambda r: (int(r[1:-1]), r[-1]))
+    
+    def get_free(rampa):
+        if rampa in EXCLUDED_RAMPAS: return []
+        cap = capacity.get(rampa, 0)
+        used = set(occ.get(rampa, {}).keys())
+        return sorted(p for p in range(1, cap+1) if p not in used)
+
+    assigned, rem = [], n_needed
+
+    # Pass 1: preferred rampas (siblings already placed nearby)
+    if preferred_rampas:
+        for rampa in sorted(preferred_rampas, key=lambda r: (int(r[1:-1]), r[-1])):
+            if rem <= 0: break
+            free = get_free(rampa)
+            if free:
+                take = free[:rem]
+                assigned.extend((rampa, p) for p in take)
+                rem -= len(take)
+
+    if rem <= 0:
+        return assigned, rem
+
+    # Pass 2: general pool (empty rampas first, then most-free)
     rampa_free = []
     for rampa in all_rampas:
-        if rampa in EXCLUDED_RAMPAS:
-            continue   # Reserved for manipulado — skip
-        cap = capacity[rampa]
-        used = set(occ.get(rampa, {}).keys())
-        free = sorted(p for p in range(1, cap+1) if p not in used)
+        if rampa in EXCLUDED_RAMPAS: continue
+        if preferred_rampas and rampa in preferred_rampas: continue  # already tried
+        free = get_free(rampa)
         if free:
-            rampa_free.append((rampa, free, len(used) == 0))
+            rampa_free.append((rampa, free, len(occ.get(rampa, {})) == 0))
     rampa_free.sort(key=lambda x: (-int(x[2]), -len(x[1])))
-    assigned, rem = [], n_needed
     for rampa, free, _ in rampa_free:
         if rem <= 0: break
         take = free[:rem]
         assigned.extend((rampa, p) for p in take)
         rem -= len(take)
+
     return assigned, rem
 
 def playa_is_e2(playa, by_dia_playa):
@@ -327,7 +379,7 @@ def get_slot_structure(postex_entries, sorexp_entries):
 
 def assign_especial(orig_dia, orig_playa, new_dia, raw_bloque, id_cluster,
                     by_dia_playa, tagged, capacity, bloque_timings, freed_in_new_dia,
-                    run_occ_new_dia=None):
+                    run_occ_new_dia=None, preferred_rampas=None, all_especial_playas=None):
     """
     Assign slots from (orig_dia, orig_playa) to free sorter positions in new_dia,
     respecting bloque timing and preserving the slot→destinos structure.
@@ -369,10 +421,11 @@ def assign_especial(orig_dia, orig_playa, new_dia, raw_bloque, id_cluster,
     slots, _, alm_postex, alm_sorexp = get_slot_structure(postex_orig, sorexp_orig)
     n_slots = len(slots)
 
-    freed    = freed_in_new_dia & {e['playa'] for e in tagged if e['dia'] == new_dia}
+    # Exclude all especial playas: they're being moved so their positions are freed
+    freed    = (all_especial_playas or set()) | freed_in_new_dia
     occ      = build_day_occ(tagged, new_dia, new_bloque, bloque_timings,
                              exclude_playas=freed, run_occ=run_occ_new_dia)
-    assigned, unmet = find_free_slots(occ, capacity, n_slots)
+    assigned, unmet = find_free_slots(occ, capacity, n_slots, preferred_rampas=preferred_rampas)
 
     playa_tag = orig_playa.replace('ESPANA_','')[:6].replace('_','')
     new_grupo = f"ESP_{new_dia[:3]}_{playa_tag}"[:18]
@@ -410,7 +463,7 @@ def assign_especial(orig_dia, orig_playa, new_dia, raw_bloque, id_cluster,
 
 # ─── PROCESS ──────────────────────────────────────────────────────────────────
 
-def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, filter_days=None):
+def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, filter_days=None, superplaya_map=None):
     canceladas, especiales, habituales = {}, {}, {}
 
     for r in parrilla_records:
@@ -447,16 +500,36 @@ def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, fi
 
     results, added = [], 0
     especial_rows = []
-    for (dia_orig, playa), (dia_new, record) in especiales.items():
+    _last_rampas_by_prefix = {}  # (dia_new, prefix) → set of rampas used by last sibling
+    all_esp_playas = {playa for (_, playa) in especiales}  # all playas being moved (any day)
+    # Sort especiales so same-family playas (shared lexical prefix) are consecutive
+    # This lets siblings share rampas naturally via run_occ
+    def _esp_sort_key(item):
+        (dia_orig, playa), (dia_new, record) = item
+        sp = (superplaya_map or {}).get(playa.upper(), lexical_prefix(playa))
+        return (dia_new, record.get('bloque',''), sp, playa)
+    especiales_sorted = sorted(especiales.items(), key=_esp_sort_key)
+
+    for (dia_orig, playa), (dia_new, record) in especiales_sorted:
         # Day filter: skip especiales whose new day is not selected
         if filter_days and dia_new not in filter_days: continue
+        # Preferred rampas: rampas already used by the last sibling (same prefix, same new day)
+        prefix = (superplaya_map or {}).get(playa.upper(), lexical_prefix(playa))
+        pref_rampas = _last_rampas_by_prefix.get((dia_new, prefix))
+
         new_rows, info = assign_especial(
             dia_orig, playa, dia_new,
             record['bloque'], record['id_cluster'],
             by_dia_playa, tagged, capacity, bloque_timings,
             freed_per_day.get(dia_new, set()),
             run_occ.get(dia_new, {}),
+            preferred_rampas=pref_rampas,
+            all_especial_playas=all_esp_playas,
         )
+        # Update sibling proximity tracking
+        if info.get('status') == 'OK' and info.get('rampas'):
+            _last_rampas_by_prefix[(dia_new, prefix)] = set(info['rampas'].keys())
+
         # Register newly assigned positions so next playa in same run sees them
         for row in new_rows:
             if row[3] == 'POSTEX':
@@ -845,7 +918,11 @@ def main():
     if len(sys.argv) > 8 and sys.argv[8].strip():
         filter_days = set(d.strip().upper() for d in sys.argv[8].split(',') if d.strip())
         print(f"  Filtrando por días: {sorted(filter_days)}")
-    output_rows, summary = process(parrilla, tagged, by_dia_playa, capacity, bloque_timings, filter_days)
+    superplaya_path = sys.argv[9] if len(sys.argv) > 9 else None
+    superplaya_map  = load_superplaya(superplaya_path)
+    if superplaya_map:
+        print(f"  Superplayas cargadas: {len(set(superplaya_map.values()))} grupos")
+    output_rows, summary = process(parrilla, tagged, by_dia_playa, capacity, bloque_timings, filter_days, superplaya_map)
 
     ok      = [r for r in summary['assignment_results'] if r['status'] == 'OK']
     partial = [r for r in summary['assignment_results'] if r['status'] == 'PARTIAL']
