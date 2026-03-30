@@ -346,7 +346,8 @@ def write_day_sheet(
     cap_map: Dict[str, int],
     usage_by_block: Dict[str, Dict[str, Set[int]]],
     block_colors: Dict[str, str],
-    bold, title_font, center, left, border
+    bold, title_font, center, left, border,
+    block_intervals: Optional[Dict[str, Tuple[int,int]]] = None,
 ):
     subramps = sorted(cap_map.keys(), key=ramp_sort_key)
     max_pos = max(cap_map.values()) if cap_map else 14
@@ -383,18 +384,35 @@ def write_day_sheet(
         ws.column_dimensions[get_column_letter(1 + p)].width = MAX_POS_COL_WIDTH
     ws.column_dimensions[get_column_letter(multi_col_idx)].width = MULTI_COL_WIDTH
 
-    # slot_blocks[sub][slot] = {block_tokens}
-    # _CONFLICT_ tokens mark slots where two overlapping blocks both claim the position
+    # slot_blocks[sub][slot] = {block_tokens} — only non-conflict blocks
+    # evicted_slots[sub] = set of slots where a block wanted in but couldn't (for MULTI col)
     slot_blocks: Dict[str, Dict[int, Set[str]]] = defaultdict(lambda: defaultdict(set))
-    conflict_slots: Dict[str, Set[int]] = defaultdict(set)  # sub → set of conflicting slots
+    evicted_details: Dict[str, List[str]] = defaultdict(list)  # sub → ["pos NN: evicted by X3"]
     for bt, per_sub in usage_by_block.items():
         is_conflict = bt.startswith("_CONFLICT_")
+        evicted_block = bt[len("_CONFLICT_"):] if is_conflict else None
         for sub, slots in per_sub.items():
             for s in slots:
                 if is_conflict:
-                    conflict_slots[sub].add(s)
+                    evicted_details[sub].append(f"pos {s:02d}: {evicted_block} desplazado")
                 else:
                     slot_blocks[sub][s].add(bt)
+
+    # Real conflicts: slots where the assigned blocks themselves overlap in time
+    conflict_slots: Dict[str, Set[int]] = defaultdict(set)
+    for sub, slot_map in slot_blocks.items():
+        for s, blqs in slot_map.items():
+            blqs_list = list(blqs)
+            for i in range(len(blqs_list)):
+                for j in range(i + 1, len(blqs_list)):
+                    b1, b2 = blqs_list[i], blqs_list[j]
+                    iv1 = block_intervals.get(b1) if block_intervals else None
+                    iv2 = block_intervals.get(b2) if block_intervals else None
+                    if iv1 and iv2 and blocks_overlap(iv1, iv2):
+                        conflict_slots[sub].add(s)
+                        break
+                if s in conflict_slots.get(sub, set()):
+                    break
 
     row = 3
     for sub in subramps:
@@ -449,23 +467,17 @@ def write_day_sheet(
             cell.border = border
             cell.font = Font(bold=True, size=9)
 
-        # Paint conflict-only slots (slot claimed only by conflicting blocks)
-        for slot in sorted(sub_conflicts):
-            if slot > cap: continue
-            if slot in slot_blocks.get(sub, {}): continue  # already painted above
-            cell = ws.cell(row=row, column=1 + slot)
-            cell.fill = PatternFill("solid", fgColor="FF9999")
-            cell.value = "⚠"
-            cell.alignment = center
-            cell.border = border
-            cell.font = Font(bold=True, size=9)
-            multi_details.append(f"pos {slot:02d}: CONFLICTO HORARIO")
+        # (evicted blocks are noted in MULTI column but don't paint cells red)
+
+        # Add evicted blocks info to MULTI column
+        evicted = evicted_details.get(sub, [])
+        all_details = multi_details + evicted
 
         # rellenar columna MULTI_BLOQUE + comentario
-        if multi_details:
-            text = "; ".join(multi_details)
+        if all_details:
+            text = "; ".join(all_details)
             multi_cell.value = text
-            multi_cell.comment = Comment("\n".join(multi_details), f"{day_name}_multi")
+            multi_cell.comment = Comment("\n".join(all_details), f"{day_name}_multi")
 
         ws.row_dimensions[row].height = 18
         row += 1
@@ -661,7 +673,8 @@ def main():
             cap_map=cap_map,
             usage_by_block=usage_by_block,
             block_colors=block_colors,
-            bold=bold, title_font=title_font, center=center, left=left, border=border
+            bold=bold, title_font=title_font, center=center, left=left, border=border,
+            block_intervals=block_intervals,
         )
 
     ws_leg = wb.create_sheet("LEYENDA")
