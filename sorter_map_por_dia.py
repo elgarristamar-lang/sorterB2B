@@ -278,51 +278,15 @@ def compute_day_usage(
 
     usage: Dict[str, Dict[str, Set[int]]] = defaultdict(lambda: defaultdict(set))
 
-    # Build set of day names active for each block token (from intervals)
-    _ALL_DAY_NAMES = ["DOMINGO","LUNES","MARTES","MIERCOLES","JUEVES","VIERNES","SABADO"]
-
     for block_token in day_blocks:
         rows = filter_rows_by_block(grupo_df, block_token, desc_col)
         if rows.empty:
             continue
 
-        # Determine which day this block belongs to (from block_intervals start_day)
-        # Entries whose description mentions a DIFFERENT day belong to another day sheet
-        # and should not appear here (e.g. "3BLOM2_LUNES_..." when processing MARTES)
-        block_start_day = None
-        if block_intervals:
-            new_iv = block_intervals.get(block_token)
-            if new_iv:
-                # Reverse-lookup start day from interval start minute
-                day_idx = new_iv[0] // 1440
-                if 0 <= day_idx < len(_ALL_DAY_NAMES):
-                    block_start_day = _ALL_DAY_NAMES[day_idx]
-
         for _, r in rows.iterrows():
             tipo = str(r[tipo_col]).strip().upper()
             if tipo != "POSTEX":
                 continue
-
-            # Skip entries that belong to a different day
-            # e.g. "3BLOM2_LUNES_ESPANA_BENAVENTE" on MARTES day sheet
-            if block_start_day:
-                desc_str = str(r[desc_col]).upper()
-                for other_day in _ALL_DAY_NAMES:
-                    if other_day == block_start_day:
-                        continue
-                    # If desc explicitly names another day right after the block prefix, skip
-                    if f"_{other_day}_" in desc_str and f"_{block_start_day}_" not in desc_str:
-                        break
-                else:
-                    pass  # no break → ok to include
-                # Simpler: if desc contains a day name that != block_start_day → skip
-                has_other_day = any(
-                    f"_{d}_" in desc_str
-                    for d in _ALL_DAY_NAMES if d != block_start_day
-                )
-                has_own_day = f"_{block_start_day}_" in desc_str
-                if has_other_day and not has_own_day:
-                    continue  # this entry belongs to a different day
 
             sub, slot = parse_subramp_and_slot_from_elemento(r[elem_col])
             if sub is None or slot is None:
