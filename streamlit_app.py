@@ -186,10 +186,14 @@ if st.session_state.get("_run3"):
         else:
             out = tmp / f"sorter_map_{sc}.xlsx"
             with st.spinner("Generando Sorter Map…"):
-                r = subprocess.run(
-                    [sys.executable, str(BASE_DIR / "sorter_map_por_dia.py"),
-                     str(p["cap"]), str(gd), str(p["bloques"]), str(out), "Hoja1"],
-                    capture_output=True, text=True, timeout=180)
+                _sorter_cmd = [
+                    sys.executable, str(BASE_DIR / "sorter_map_por_dia.py"),
+                    str(p["cap"]), str(gd), str(p["bloques"]), str(out), "Hoja1",
+                ]
+                # Optional validation: pass parrilla + orig GD paths
+                if "parrilla" in p and "gd" in p:
+                    _sorter_cmd += [str(p["parrilla"]), sheet.strip(), str(p["gd"])]
+                r = subprocess.run(_sorter_cmd, capture_output=True, text=True, timeout=180)
             show_log(r)
             if r.returncode == 0 and out.exists():
                 st.session_state["r3_map"] = (out.name, out.read_bytes())
