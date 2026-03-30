@@ -223,7 +223,8 @@ def load_parrilla(path, sheet_name):
              'dia_salida': g('DIA_SALIDA'), 'cutoff': g('CUTOFF'),
              'dia_salida_new': g('DIA_SALIDA_NEW'),
              'bloque': g('BLOQUE'), 'nomenclatura': g('NOMENCLATURA'),
-             'tipo_salida': g('TIPO_SALIDA'), 'id_cluster': g('ID_CLUSTER')}
+             'tipo_salida': g('TIPO_SALIDA'), 'id_cluster': g('ID_CLUSTER'),
+             'mantener_original': g('MANTENER_ORIGINAL','').strip().upper() == 'SI'}
         if r['playa'] and r['tipo_salida']:
             records.append(r)
     return records
@@ -386,12 +387,20 @@ def find_free_slots(occ, capacity, n_needed, preferred_rampas=None, committed_gr
         grp = _ramp_group(rampa)
         in_group = (committed_group is None or grp == committed_group)
         proximity = _ramp_proximity_key(rampa, _anchor) if _anchor else _ramp_number(rampa)
+        # Empty rampas WITH anchor: use real proximity (prefer close empty rampas)
+        # Empty rampas WITHOUT anchor: proximity=0 → sort by combined capacity
+        # Non-empty rampas: use real proximity
+        if is_empty and _anchor:
+            effective_prox = proximity  # closest empty rampa to existing assignments
+        elif is_empty:
+            effective_prox = 0          # no anchor → all empty equal, sort by capacity
+        else:
+            effective_prox = proximity + 1  # non-empty: always worse than any empty
         return (
             -int(in_group),          # committed group first
-            proximity,               # closest to existing assignments
+            effective_prox,          # empty rampas preferred (0 or real dist)
             -int(mate_free_n > 0),   # pair-mate available
             -combined,               # most combined free
-            -int(is_empty),
             -len(free),
         )
     rampa_free.sort(key=_sort_key)
@@ -554,8 +563,13 @@ def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, fi
             habituales[(dia_orig, playa)] = r
 
     freed_per_day = defaultdict(set)
+    mantener_set: set = set()  # (dia_orig, playa) → keep original entries
     for (dia, playa) in canceladas: freed_per_day[dia].add(playa)
-    for (dia_orig, playa) in especiales: freed_per_day[dia_orig].add(playa)
+    for (dia_orig, playa), (dia_new, r) in especiales.items():
+        if r.get('mantener_original'):
+            mantener_set.add((dia_orig, playa))
+        else:
+            freed_per_day[dia_orig].add(playa)
 
     output_rows = []
     rem_cancel = rem_moved = kept = kept_nw = 0
@@ -565,7 +579,10 @@ def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, fi
             output_rows.append(entry['_raw']); kept_nw += 1; continue
         key = (entry['dia'], entry['playa'])
         if key in canceladas: rem_cancel += 1; continue
-        if key in especiales: rem_moved  += 1; continue
+        if key in especiales and key not in mantener_set:
+            rem_moved += 1; continue
+        elif key in especiales and key in mantener_set:
+            pass  # MANTENER_ORIGINAL=SI → keep original AND add new-day entries
         # Day filter: skip entries not in selected days (when filter active)
         if filter_days and entry['dia'] not in filter_days: continue
         output_rows.append(entry['_raw']); kept += 1
