@@ -311,15 +311,61 @@ def find_free_slots(occ, capacity, n_needed, preferred_rampas=None):
     if rem <= 0:
         return assigned, rem
 
+    # Compute pair-mates of preferred rampas — try these next before general pool
+    def _pair_mate(r):
+        if not r or len(r) < 2: return None
+        last = r[-1]
+        if last == 'A': return r[:-1] + 'B'
+        if last == 'B': return r[:-1] + 'A'
+        if last == 'C': return r[:-1] + 'D'
+        if last == 'D': return r[:-1] + 'C'
+        return None
+
+    pair_rampas = set()
+    if preferred_rampas:
+        for r in preferred_rampas:
+            pm = _pair_mate(r)
+            if pm and pm not in preferred_rampas:
+                pair_rampas.add(pm)
+
+    # Pass 1.5: pair-mate rampas (same pair as siblings)
+    for rampa in sorted(pair_rampas, key=lambda r: (int(r[1:-1]), r[-1])):
+        if rem <= 0: break
+        free = get_free(rampa)
+        if free:
+            take = free[:rem]
+            assigned.extend((rampa, p) for p in take)
+            rem -= len(take)
+
+    if rem <= 0:
+        return assigned, rem
+
     # Pass 2: general pool (empty rampas first, then most-free)
+    already_tried = (preferred_rampas or set()) | pair_rampas
     rampa_free = []
     for rampa in all_rampas:
         if rampa in EXCLUDED_RAMPAS: continue
-        if preferred_rampas and rampa in preferred_rampas: continue  # already tried
+        if rampa in already_tried: continue
         free = get_free(rampa)
         if free:
             rampa_free.append((rampa, free, len(occ.get(rampa, {})) == 0))
-    rampa_free.sort(key=lambda x: (-int(x[2]), -len(x[1])))
+    # Sort: complete-pair first (both A+B or C+D free), then empty, then most-free
+    def _pair_mate_of(r):
+        last = r[-1] if r else ''
+        m = {'A':'B','B':'A','C':'D','D':'C'}.get(last)
+        return r[:-1]+m if m else None
+
+    def _sort_key(x):
+        rampa, free, is_empty = x
+        mate = _pair_mate_of(rampa)
+        mate_free_n = 0
+        if mate and mate not in EXCLUDED_RAMPAS:
+            mate_slots = get_free(mate)
+            mate_free_n = len(mate_slots)
+        # combined free slots with pair-mate
+        combined = len(free) + mate_free_n
+        return (-int(mate_free_n > 0), -combined, -int(is_empty), -len(free))
+    rampa_free.sort(key=_sort_key)
     for rampa, free, _ in rampa_free:
         if rem <= 0: break
         take = free[:rem]
