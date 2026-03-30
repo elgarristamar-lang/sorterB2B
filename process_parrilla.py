@@ -366,7 +366,8 @@ def find_free_slots(occ, capacity, n_needed,
         mate       = pair_of(r)
         mate_free  = len(get_free(mate)) if mate and mate not in EXCLUDED_RAMPAS else 0
         # Vacía+anchor→proximidad real; vacía sin anchor→número bajo; no vacía→peor
-        eff_prox   = prox if (is_empty and _anchor) else (_ramp_number(r) if is_empty else 1000 + prox)
+        # Empty+anchor → closest to anchor; Empty+no anchor → biggest free first; Non-empty → last
+        eff_prox = prox if (is_empty and _anchor) else (-len(free) if is_empty else 1000 + prox)
         return (-int(in_group), eff_prox, -int(mate_free > 0), -(len(free) + mate_free))
 
     pool = sorted([r for r in capacity if r not in EXCLUDED_RAMPAS and r not in tried
