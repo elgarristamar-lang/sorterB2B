@@ -617,11 +617,19 @@ def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, fi
         cg  = _committed_group.get((dia_new, prefix))
         an  = _anchor_numbers.get((dia_new, prefix))
 
+        # Resolve the correct bloque using especial_bloque_map first (same logic as assign_especial)
+        _raw_bloque_presel = record.get('bloque', '')
+        _is_na_presel = not _raw_bloque_presel or str(_raw_bloque_presel).strip().upper() in ('#N/A','N/A','NONE','NO_BLOQUE','')
+        if _is_na_presel and especial_bloque_map:
+            _raw_bloque_presel = especial_bloque_map.get((dia_new.upper(), playa), _raw_bloque_presel)
+        _presel_bloque = (_raw_bloque_presel if _raw_bloque_presel and str(_raw_bloque_presel).strip().upper() not in ('#N/A','N/A','NONE','NO_BLOQUE','')
+                         else resolve_bloque_for_new_day(record.get('id_cluster',''), dia_new, bloque_timings) or '')
+
         # If no committed group yet, pre-select the group with most available slots
         if cg is None:
             occ_snap = build_day_occ(
-                tagged, dia_new, 
-                resolve_bloque_for_new_day(record.get('id_cluster',''), dia_new, bloque_timings) or '',
+                tagged, dia_new,
+                _presel_bloque,
                 bloque_timings, exclude_playas=all_esp_playas,
                 run_occ=run_occ.get(dia_new, {}))
             par_free_n = sum(
