@@ -201,45 +201,65 @@ def load_bloques_horarios(path: Path) -> pd.DataFrame:
 # -----------------------------
 # Colores por bloque (reutilizables entre días)
 # -----------------------------
-PALETTE = [
-    "BDD7EE",  # azul claro
-    "C6E0B4",  # verde claro
-    "F8CBAD",  # naranja claro
-    "D9E1F2",  # lila claro
-    "E7E6E6",  # gris claro
-    "FFF2CC",  # amarillo claro
+# ── MANGO Color System ───────────────────────────────────────────────────────
+# Monochrome palette: black/white/grey base (Mango brand language)
+# Each day family uses subtle tinted greys — numbered blocks get lighter
+# Especiales = FFFF00 (yellow), Conflictos reales = B91C1C (rojo)
+# Text is always #1A1A1A (near-black) for maximum readability
+
+# Dark-to-light ramp: idx0 ≈ near-black (#1E), idx9 ≈ near-white (#F0)
+# Each step ~21 grey units apart → clearly distinguishable at a glance
+# Subtle hue tint per day family for extra differentiation
+# ── Color system: index-based, cross-day consistent ────────────────────────
+# D1 = L1 = M1 = X1 = J1 same color (index determines color, not day)
+# 10 distinct professional colors — light bg + dark coordinated text
+# Especiales: FFFF00 (amarillo) | Conflictos reales: B91C1C (rojo)
+
+_INDEX_COLORS = [
+    ("0D3B6E", "FFFFFF"),  # 0 — navy profundo
+    ("1A5494", "FFFFFF"),  # 1 — azul medio
+    ("2471B8", "FFFFFF"),  # 2 — azul estándar
+    ("3A8FD4", "FFFFFF"),  # 3 — azul claro-medio
+    ("5BA3DC", "1A1A1A"),  # 4 — azul claro
+    ("174A7E", "FFFFFF"),  # 5 — azul índigo
+    ("0E6B8A", "FFFFFF"),  # 6 — azul-teal
+    ("2C5F8A", "FFFFFF"),  # 7 — azul acero
+    ("4B82B0", "FFFFFF"),  # 8 — azul grisáceo
+    ("1A3A5C", "FFFFFF"),  # 9 — azul oscuro
 ]
 
+MANGO_ESP  = "F5C518"   # especial — amarillo ejecutivo (texto oscuro)
+MANGO_CONF = "CC1414"   # conflicto real — rojo (solo solapamientos temporales)
+
+PALETTE     = [bg for bg, _ in _INDEX_COLORS]   # legacy reference
+PALETTE_ESP = [MANGO_ESP] * 10
+
+MANGO_BLACK  = "000000"
+MANGO_WHITE  = "FFFFFF"
+MANGO_TEXT   = "1A1A1A"
+MANGO_MUTED  = "999999"
+MANGO_BORDER = "EBEBEB"
+
 def _darken(hex_color: str, factor: float = 0.75) -> str:
-    """Return a darker version of a hex color."""
     r = int(int(hex_color[0:2], 16) * factor)
     g = int(int(hex_color[2:4], 16) * factor)
     b = int(int(hex_color[4:6], 16) * factor)
     return f"{r:02X}{g:02X}{b:02X}"
 
-# Especial colors: same palette but darker
-# Especiales: amarillo fosforito fijo para máxima visibilidad
-PALETTE_ESP = ["FFFF00"] * 10  # amarillo fosforito
+def _text_for_idx(idx: int) -> str:
+    """Coordinated dark text for each block index."""
+    return _INDEX_COLORS[idx % len(_INDEX_COLORS)][1]
 
 def build_block_color_map_for_day(day_code: str) -> Dict[str, str]:
-    m: Dict[str, str] = {}
-    for i in range(10):
-        key = f"{day_code}{i}"
-        m[key] = PALETTE[i % len(PALETTE)]
-    return m
+    """Color by block index only — same index = same color across all days."""
+    return {f"{day_code}{i}": _INDEX_COLORS[i % len(_INDEX_COLORS)][0] for i in range(10)}
 
 def build_especial_color_map_for_day(day_code: str) -> Dict[str, str]:
-    m: Dict[str, str] = {}
-    for i in range(10):
-        key = f"{day_code}{i}"
-        m[key] = PALETTE_ESP[i % len(PALETTE_ESP)]
-    return m
-
+    return {f"{day_code}{i}": MANGO_ESP for i in range(10)}
 
 
 # -----------------------------
-# Block timing helpers
-# -----------------------------
+
 _DAY_IDX = {"DOMINGO":0,"LUNES":1,"MARTES":2,"MIERCOLES":3,"JUEVES":4,"VIERNES":5,"SABADO":6}
 
 def _time_to_min(t) -> int:
@@ -341,6 +361,10 @@ def compute_day_usage(
                     usage[f"_CONFLICT_{block_token}"][sub].add(slot)
                     continue
 
+            # Skip cancelled entries — not painted on map
+            _desc_str_pre = str(r[desc_col])
+            if "CANCELAD" in _desc_str_pre.upper():
+                continue
             usage[block_token][sub].add(slot)
             # Track playa name for cell tooltip
             _desc_str = str(r[desc_col])
@@ -432,37 +456,39 @@ def write_day_sheet(
     especial_by_block: Optional[Dict[str, Dict[str, Set[int]]]] = None,
     especial_colors: Optional[Dict[str, str]] = None,
     playa_by_block: Optional[Dict[str, Dict[str, Dict[int, Set[str]]]]] = None,
+    e2_playas: Optional[List[Tuple[str, str]]] = None,
+    cancelled_esp=None,  # set of cancelled playa names (for conflict detection)
+    canceladas_dia=None, # list of playa names cancelled on this day (show at bottom)
 ):
     subramps = sorted(cap_map.keys(), key=ramp_sort_key)
     max_pos = max(cap_map.values()) if cap_map else 14
 
-    # Title
-    ws["A1"] = f"SORTER MAP - {day_name} (agrega {day_code}0..{day_code}5) | slots POSTEX"
-    ws["A1"].font = title_font
+    # ── Title row — Mango: black bg, white text, no bold ─────────────────────
+    ws["A1"].font = Font(bold=False, size=11, color=MANGO_WHITE,
+                         name="Aptos Display")
     ws["A1"].alignment = Alignment(horizontal="left", vertical="center")
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=2 + max_pos)  # + MULTI col
-    ws.row_dimensions[1].height = 22
+    ws["A1"].fill = PatternFill("solid", fgColor=MANGO_BLACK)
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=2 + max_pos)
+    ws.row_dimensions[1].height = 26
 
-    # Header row
-    ws["A2"] = "Subrampa"
-    ws["A2"].font = bold
-    ws["A2"].alignment = center
-    ws["A2"].border = border
+    # ── Column headers — Mango: very light grey bg, dark text ─────────────────
+    HDR_FILL = PatternFill("solid", fgColor="F0F0F0")
+    HDR_FONT = Font(bold=False, size=9, color=MANGO_MUTED, name="Aptos Display")
+    sub_hdr = ws.cell(row=2, column=1, value="SUBRAMPA")
+    sub_hdr.font = HDR_FONT; sub_hdr.fill = HDR_FILL
+    sub_hdr.alignment = center; sub_hdr.border = border
 
     for p in range(1, max_pos + 1):
         c = ws.cell(row=2, column=1 + p, value=f"{p:02d}")
-        c.font = bold
-        c.alignment = center
-        c.border = border
+        c.font = Font(bold=False, size=8, color=MANGO_MUTED, name="Aptos Display")
+        c.fill = HDR_FILL; c.alignment = center; c.border = border
 
-    # New extra column
     multi_col_idx = 2 + max_pos
-    h = ws.cell(row=2, column=multi_col_idx, value="MULTI_BLOQUE")
-    h.font = bold
-    h.alignment = center
-    h.border = border
+    h = ws.cell(row=2, column=multi_col_idx, value="MULTI-BLOQUE")
+    h.font = HDR_FONT; h.fill = HDR_FILL
+    h.alignment = center; h.border = border
 
-    # widths
+    # ── Column widths ──────────────────────────────────────────────────────────
     ws.column_dimensions["A"].width = SUBRAMPA_COL_WIDTH
     for p in range(1, max_pos + 1):
         ws.column_dimensions[get_column_letter(1 + p)].width = MAX_POS_COL_WIDTH
@@ -522,8 +548,12 @@ def write_day_sheet(
         cap = cap_map[sub]
 
         # Subramp cell
+        # Alternating row background + rampa group color strip
+        _row_bg = "F8F8F8" if (row % 2 == 0) else MANGO_WHITE
+
         name_cell = ws.cell(row=row, column=1, value=sub)
-        name_cell.font = bold
+        name_cell.font = Font(bold=False, size=9, color=MANGO_TEXT, name="Aptos Display")
+        name_cell.fill = PatternFill("solid", fgColor=_row_bg)
         name_cell.alignment = left
         name_cell.border = border
 
@@ -533,12 +563,22 @@ def write_day_sheet(
             c.border = border
             c.alignment = center
             if p > cap:
-                c.fill = PatternFill("solid", fgColor="F2F2F2")
+                c.fill = PatternFill("solid", fgColor="F5F5F5")
+                c.font = Font(size=7, color="DEDEDE")
 
         # MULTI column base
+        # Row fill for empty base grid cells (alternating)
+        _row_fill = PatternFill("solid", fgColor=_row_bg)
+        for _pc in range(1, max_pos + 1):
+            _base_c = ws.cell(row=row, column=1 + _pc)
+            if not _base_c.value:
+                _base_c.fill = _row_fill
+
         multi_cell = ws.cell(row=row, column=multi_col_idx, value="")
+        multi_cell.fill = PatternFill("solid", fgColor=_row_bg)
         multi_cell.border = border
-        multi_cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+        multi_cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=False)
+        multi_cell.font = Font(bold=False, size=8, color=MANGO_MUTED, name="Aptos Display")
 
         # paint used slots + put BLOCK text
         multi_details: List[str] = []  # "pos 02: J1+J2"
@@ -552,9 +592,10 @@ def write_day_sheet(
             blocks_sorted = sorted(blocks_here)
 
             if slot in sub_conflicts:
-                # Timing conflict: two overlapping blocks claim this slot → red/orange
-                cell.fill = PatternFill("solid", fgColor="FF9999")
-                cell.value = "⚠" + "+".join(blocks_sorted)
+                # Real timing conflict → Mango red
+                cell.fill = PatternFill("solid", fgColor=MANGO_CONF)
+                cell.value = "+".join(blocks_sorted)
+                cell.font = Font(bold=False, size=8, color=MANGO_WHITE, name="Aptos Display")
                 multi_details.append(f"pos {slot:02d}: CONFLICTO " + "+".join(blocks_sorted))
             elif len(blocks_sorted) == 1:
                 b = blocks_sorted[0]
@@ -568,7 +609,7 @@ def write_day_sheet(
                 # Multiple blocks but no timing conflict (compatible time windows)
                 # Yellow if any block in this slot is an especial
                 has_esp = slot in esp_sub_slots.get(sub, set())
-                cell.fill = PatternFill("solid", fgColor="FFFF00" if has_esp else "BFBFBF")
+                cell.fill = PatternFill("solid", fgColor=MANGO_ESP if has_esp else "DEDEDE")
                 # Short label: first block + "+N" if more than 2, full name if 2
                 if len(blocks_sorted) == 2:
                     cell.value = blocks_sorted[0] + "+" + blocks_sorted[1]
@@ -588,10 +629,18 @@ def write_day_sheet(
             # Also paint conflict slots not yet in slot_blocks
             cell.alignment = center
             cell.border = border
-            # Smaller font for multi-block; italic for especial
-            n_blocks = len(blocks_here) if slot not in conflict_slots.get(sub, set()) else 2
             is_esp_slot = slot in esp_sub_slots.get(sub, set())
-            cell.font = Font(bold=True, italic=is_esp_slot, size=7 if n_blocks > 1 else 9)
+            # Text color: white on red conflict, dark on yellow esp, index-coordinated otherwise
+            if slot in conflict_slots.get(sub, set()):
+                _txt = "FFFFFF"
+            elif is_esp_slot:
+                _txt = "1A1A1A"
+            elif len(blocks_sorted) == 1:
+                _idx = int(blocks_sorted[0][1:]) if len(blocks_sorted[0]) > 1 and blocks_sorted[0][1:].isdigit() else 0
+                _txt = _text_for_idx(_idx)
+            else:
+                _txt = "555555"
+            cell.font = Font(bold=False, size=8, color=_txt)
             # Tooltip only for single-block cells (multi-block info is in MULTI_BLOQUE column)
             if len(blocks_here) == 1 and slot not in conflict_slots.get(sub, set()) and playa_by_block:
                 _tip_lines = []
@@ -628,7 +677,7 @@ def write_day_sheet(
             multi_cell.value = text
             multi_cell.comment = Comment("\n".join(all_details), f"{day_name}_multi")
 
-        ws.row_dimensions[row].height = 18
+        ws.row_dimensions[row].height = 20
         row += 1
 
     # ── Summary row ─────────────────────────────────────────────────────────
@@ -652,26 +701,30 @@ def write_day_sheet(
     # Write summary row
     summary_label = ws.cell(row=row, column=1,
         value=f"TOTAL: {regular_slots_total} regulares · {especial_slots_total} especiales")
-    summary_label.font = Font(bold=True, size=10)
+    summary_label.font = Font(bold=False, size=9, color=MANGO_WHITE, name="Aptos Display")
     summary_label.alignment = Alignment(horizontal="left", vertical="center")
-    summary_label.fill = PatternFill("solid", fgColor="D9E1F2")
+    summary_label.fill = PatternFill("solid", fgColor=MANGO_BLACK)
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=multi_col_idx)
-    ws.row_dimensions[row].height = 18
+    ws.row_dimensions[row].height = 20
 
     # Update title to include totals
     ws["A1"] = (
-        f"SORTER MAP - {day_name} (agrega {day_code}0..{day_code}5) | slots POSTEX  "
-        f"│  Regulares: {regular_slots_total}  │  Especiales: {especial_slots_total}"
+        f"  SORTER MAP — {day_name}  │  Regulares: {regular_slots_total}  │  Especiales: {especial_slots_total}"
     )
+    ws["A1"].font = Font(bold=False, size=11, color=MANGO_WHITE, name="Aptos Display")
+    ws["A1"].fill = PatternFill("solid", fgColor=MANGO_BLACK)
 
 
     # ── Side table: especiales resumen ──────────────────────────────────────
-    if playa_by_block and especial_by_block:
+    if playa_by_block or e2_playas or canceladas_dia:
         from openpyxl.styles import PatternFill as _PF2, Font as _F2, Alignment as _A2
-        SIDE_HEAD_FILL = _PF2("solid", fgColor="1F3864")
-        SIDE_HEAD_FONT = _F2(bold=True, color="FFFFFF", size=9)
+        SIDE_HEAD_FILL = _PF2("solid", fgColor="F0F0F0")
+        SIDE_HEAD_FONT = _F2(bold=False, color="999999", size=9)
+        SIDE_TITLE_FILL = _PF2("solid", fgColor="000000")
+        SIDE_TITLE_FONT = _F2(bold=False, color="FFFFFF", size=10)
         SIDE_ESP_FILL  = _PF2("solid", fgColor="FFFF00")
         SIDE_REG_FILL  = _PF2("solid", fgColor="FFFFFF")
+        SIDE_ALT_FILL  = _PF2("solid", fgColor="FAFAFA")
         _center = Alignment(horizontal="center", vertical="center", wrap_text=False)
         _left   = Alignment(horizontal="left",   vertical="center", wrap_text=False)
         _wrap   = Alignment(horizontal="left",   vertical="center", wrap_text=True)
@@ -692,33 +745,36 @@ def write_day_sheet(
                         dia_d, playa = item if isinstance(item, tuple) else ('', item)
                         esp_playa_slots[playa][bt].append((sub, slot, dia_d))
 
-        if esp_playa_slots:
-            # Column positions: gap after MULTI_BLOQUE
-            SC = multi_col_idx + 2  # start col for side table
+        # Sort: valid especiales first, then cancelled at bottom
+        _cancelled_set_local = set(cancelled_esp) if cancelled_esp else set()
+        # Always set SC and headers if we have anything to show
+        SC = multi_col_idx + 2
+        _has_anything = esp_playa_slots or e2_playas or canceladas_dia
+        if _has_anything:
+            sr = 3  # start row for side table entries
+            # Column widths + headers (always when there's content)
+            ws.column_dimensions[get_column_letter(SC)].width     = 10
+            ws.column_dimensions[get_column_letter(SC+1)].width   = 34
+            ws.column_dimensions[get_column_letter(SC+2)].width   = 10
+            ws.column_dimensions[get_column_letter(SC+3)].width   = 55
 
-            # Set column widths
-            ws.column_dimensions[get_column_letter(SC)].width     = 10   # DÍA_NEW
-            ws.column_dimensions[get_column_letter(SC+1)].width   = 34   # PLAYA
-            ws.column_dimensions[get_column_letter(SC+2)].width   = 10   # BLOQUE
-            ws.column_dimensions[get_column_letter(SC+3)].width   = 55   # POSICIONES
-
-            # Header row at row 2
-            for ci, hdr in enumerate(["DÍA", "PLAYA ESPECIAL", "BLOQUE", "POSICIONES"], SC):
-                c = ws.cell(row=2, column=ci, value=hdr)
+            for ci, hdr_t in enumerate(["DÍA", "PLAYA / RUTA", "BLOQUE", "POSICIONES / ESTADO"], SC):
+                c = ws.cell(row=2, column=ci, value=hdr_t)
                 c.fill = SIDE_HEAD_FILL; c.font = SIDE_HEAD_FONT
                 c.alignment = _center; c.border = border
 
-            # Merge title across side table
-            ws.cell(row=1, column=SC, value="ESPECIALES — RESUMEN DE ASIGNACIÓN")
-            ws.cell(row=1, column=SC).font = _F2(bold=True, size=10, color="1F3864")
-            ws.cell(row=1, column=SC).alignment = _center
+            _t = ws.cell(row=1, column=SC, value="ESPECIALES — RESUMEN DE ASIGNACIÓN")
+            _t.font = SIDE_TITLE_FONT; _t.fill = SIDE_TITLE_FILL; _t.alignment = _center
             try:
                 ws.merge_cells(start_row=1, start_column=SC, end_row=1, end_column=SC+3)
             except Exception: pass
 
+        if esp_playa_slots:
+
             # Data rows — sorted by playa name
             sr = 3
-            for playa in sorted(esp_playa_slots.keys()):
+            for playa in sorted(esp_playa_slots.keys(),
+                             key=lambda p: (1 if p.upper() in _cancelled_set_local else 0, p)):
                 bt_map = esp_playa_slots[playa]
                 for bt in sorted(bt_map.keys()):
                     slots_list = sorted(bt_map[bt], key=lambda x: (x[0], x[1]))
@@ -733,14 +789,69 @@ def write_day_sheet(
                         f"{sub}[{','.join(str(s) for s in sorted(slots))}]"
                         for sub, slots in sorted(by_sub.items(), key=lambda x: ramp_sort_key(x[0]))
                     )
-                    vals = [dia_display, playa, bt, pos_str]
+                    # Check if this playa is cancelled in the semana especial sheet
+                    _is_cancelled = (cancelled_esp is not None
+                                     and playa.upper() in cancelled_esp)
+                    vals = [dia_display, playa, bt,
+                            "⚠ CANCELADA — REVISAR" if _is_cancelled else pos_str]
                     alns = [_center, _left, _center, _wrap]
+                    if _is_cancelled:
+                        _row_fill = _PF2("solid", fgColor="FFE0B2")  # naranja claro
+                    else:
+                        _row_fill = SIDE_ESP_FILL if sr % 2 == 0 else _PF2("solid", fgColor="FFF5A0")
                     for ci, (val, aln) in enumerate(zip(vals, alns), SC):
                         c = ws.cell(row=sr, column=ci, value=val)
-                        c.fill = SIDE_ESP_FILL; c.border = border; c.alignment = aln
-                        c.font = _F2(size=8, italic=(ci == SC))
-                    ws.row_dimensions[sr].height = 26
+                        c.fill = _row_fill; c.border = border; c.alignment = aln
+                        if _is_cancelled:
+                            # Strikethrough + orange text for cancelled
+                            c.font = _F2(size=8, bold=False, italic=True,
+                                         color="CC4400",
+                                         strike=(ci == SC+1))  # strikethrough on playa name
+                        elif ci == SC:
+                            c.font = _F2(size=8, bold=False, italic=True, color="999999")
+                        elif ci == SC+2:
+                            c.font = _F2(size=9, bold=False, color="1A1A1A")
+                        elif ci == SC+1:
+                            c.font = _F2(size=8, bold=False, color="1A1A1A")
+                        else:
+                            c.font = _F2(size=8, color="666666")
+                    ws.row_dimensions[sr].height = 22
                     sr += 1
+
+        # ── E2/Manual routes ────────────────────────────────────────────────────
+        if e2_playas:
+            E2_FILL  = _PF2("solid", fgColor="D0E4F0")   # azul suave
+            E2_MUTED = _F2(size=8, bold=False, italic=True, color="1A4A6B")
+            for _e2_playa, _e2_bt in sorted(e2_playas, key=lambda x: x[0]):
+                vals = [day_name, _e2_playa, _e2_bt, "E2 / MANUAL — no pasa por sorter"]
+                alns = [_center, _left, _center, _wrap]
+                for ci, (val, aln) in enumerate(zip(vals, alns), SC):
+                    c = ws.cell(row=sr, column=ci, value=val)
+                    c.fill = E2_FILL; c.border = border; c.alignment = aln
+                    c.font = E2_MUTED
+                ws.row_dimensions[sr].height = 18
+                sr += 1
+
+        # ── Plain CANCELADAS (not in GD, no conflict — informational) ─────────
+        if canceladas_dia:
+            CANC_FILL = _PF2("solid", fgColor="F0F0F0")   # gris muy claro
+            CANC_FONT = _F2(size=8, bold=False, italic=True, color="999999", strike=True)
+            _esp_playa_names = {p.upper() for p in esp_playa_slots} if esp_playa_slots else set()
+            for _canc_pl in sorted(set(canceladas_dia)):
+                # Skip if already shown as ⚠ REVISAR (it's in esp_playa_slots)
+                if _canc_pl.upper() in _esp_playa_names: continue
+                vals = [day_name, _canc_pl, "—", "CANCELADA"]
+                alns = [_center, _left, _center, _left]
+                for ci, (val, aln) in enumerate(zip(vals, alns), SC):
+                    c = ws.cell(row=sr, column=ci, value=val)
+                    c.fill = CANC_FILL; c.border = border; c.alignment = aln
+                    # Strikethrough on playa name, muted on rest
+                    if ci == SC+1:
+                        c.font = _F2(size=8, bold=False, italic=True, color="999999", strike=True)
+                    else:
+                        c.font = _F2(size=8, bold=False, italic=True, color="BBBBBB")
+                ws.row_dimensions[sr].height = 18
+                sr += 1
 
     ws.freeze_panes = "B3"
 
@@ -1019,7 +1130,7 @@ def write_validation_sheet(ws, grupo_df, cap_map, block_intervals,
             if col in (1, 2):
                 c.fill = fills.get(status, INFO_FILL)
                 c.font = fonts.get(status, INFO_FONT)
-        ws.row_dimensions[row].height = 18
+        ws.row_dimensions[row].height = 20
 
     # ── Header ────────────────────────────────────────────────────────────────
     row = 1
@@ -1275,6 +1386,63 @@ def main():
 
     block_intervals = build_block_intervals(bloques)
 
+    # ── Load E2/manual routes + cancelled especiales from parrilla ────────────
+    _e2_by_day: dict = defaultdict(list)
+    _cancelled_esp: set = set()   # playa names cancelled in semana especial sheet
+    _par_path = _sys.argv[6] if len(_sys.argv) > 6 else None
+    if _par_path:
+        try:
+            from openpyxl import load_workbook as _lwb_e2
+            _wb_e2 = _lwb_e2(_par_path, read_only=True)
+            # Read cancelled entries from SEMANA SANTA sheet
+            import re as _re_ss
+            for _sh_name in _wb_e2.sheetnames:
+                if 'SEMANA' in _sh_name.upper() or 'SANTA' in _sh_name.upper() or 'W1' in _sh_name:
+                    _ss_rows = list(_wb_e2[_sh_name].iter_rows(values_only=True))
+                    _ss_hdr = {str(h).strip().upper(): i for i, h in enumerate(_ss_rows[0]) if h}
+                    _canceladas_por_dia: dict = defaultdict(list)
+                    for _r_ss in _ss_rows[1:]:
+                        _ss_tipo = str(_r_ss[_ss_hdr.get('TIPO_SALIDA', 99)] or '').strip().upper()
+                        if _ss_tipo != 'CANCELADA': continue
+                        _ss_dpn = str(_r_ss[_ss_hdr.get('DIA_PLAYA_NEW', 1)] or '').strip()
+                        _ss_dpo = str(_r_ss[_ss_hdr.get('DIA_PLAYA_ORIGINAL', 2)] or '').strip()
+                        # Playa name: strip CANCELADA_ prefix from DIA_PLAYA_NEW
+                        if _ss_dpn.upper().startswith('CANCELADA_'):
+                            _playa_c = _ss_dpn[10:].strip()
+                        else:
+                            _m_c = _re_ss.match(r'(?:DOMINGO|LUNES|MARTES|MIERCOLES|JUEVES|VIERNES|SABADO)_(.+)', _ss_dpn, _re_ss.IGNORECASE)
+                            _playa_c = _m_c.group(1).strip() if _m_c else ''
+                        # Original day from DIA_PLAYA_ORIGINAL
+                        _m_co = _re_ss.match(r'(DOMINGO|LUNES|MARTES|MIERCOLES|JUEVES|VIERNES|SABADO)_', _ss_dpo, _re_ss.IGNORECASE)
+                        _dia_c = _m_co.group(1).upper() if _m_co else ''
+                        if _playa_c:
+                            _cancelled_esp.add(_playa_c.upper())
+                            if _dia_c:
+                                _canceladas_por_dia[_dia_c].append(_playa_c)
+                    break
+            _sh_e2 = next((s for s in _wb_e2.sheetnames
+                           if 'parrilla' in s.lower() or 'test' in s.lower()),
+                          _wb_e2.sheetnames[0])
+            _rows_e2 = list(_wb_e2[_sh_e2].iter_rows(values_only=True))
+            _hdr_e2 = {str(h).strip().upper(): i for i, h in enumerate(_rows_e2[0]) if h}
+            _KNOWN_E2 = {"BOSNIA_CPT","CHIPRE_NORTE","INDONESIA","CHIPRE",
+                         "BOSNIA_CPT_2","CHIPRE_NORTE_2","INDONESIA_CPT"}
+            for _r_e2 in _rows_e2[1:]:
+                _tipo_e2  = str(_r_e2[_hdr_e2.get('TIPO_SALIDA', 99)] or '').upper()
+                _playa_e2 = str(_r_e2[_hdr_e2.get('PLAYA', 99)] or '').strip()
+                _dia_e2   = str(_r_e2[_hdr_e2.get('DIA_SALIDA_NEW', 99)] or '').strip().upper()
+                _blq_e2   = str(_r_e2[_hdr_e2.get('BLOQUE', 99)] or '').strip()
+                if 'CANCELADA' in _tipo_e2: continue
+                if 'ESPECIAL DIA CAMBIO' not in _tipo_e2: continue
+                if (_playa_e2.upper() in _KNOWN_E2
+                        or 'E2' in _tipo_e2 or 'MANUAL' in _tipo_e2 or 'EXDOCK' in _tipo_e2):
+                    if _dia_e2:
+                        _e2_by_day[_dia_e2].append((_playa_e2, _blq_e2))
+        except Exception:
+            _canceladas_por_dia = defaultdict(list)  # parrilla unavailable
+    if '_canceladas_por_dia' not in dir():
+        _canceladas_por_dia: dict = defaultdict(list)
+
     all_playa_data = []
     for day_name, day_code in DAY_SHEETS:
         # Detect max block index from block_intervals for this day_code
@@ -1304,6 +1472,9 @@ def main():
             especial_by_block=especial_by_block,
             especial_colors=especial_colors,
             playa_by_block=playa_by_block,
+            e2_playas=_e2_by_day.get(day_name, []),
+            cancelled_esp=_cancelled_esp,
+            canceladas_dia=_canceladas_por_dia.get(day_name, []),
         )
 
         # Collect data for PLAYAS_POR_RAMPA sheet
