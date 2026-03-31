@@ -38,16 +38,40 @@ st.set_page_config(page_title="Sorter VDL B2B", page_icon="🏭", layout="center
 
 MANGO_CSS = """
 <style>
-  html, body, [class*="css"], .stApp {
+  /* ── Fonts & background ── */
+  html, body, .stApp, [class*="css"] {
     font-family: "Mango New", "Aptos Display", "Trebuchet MS", Arial, sans-serif !important;
     background: #f0f0f0 !important;
   }
-  .block-container {
+  /* ── White card: all known Streamlit container selectors ── */
+  .block-container,
+  .stMainBlockContainer,
+  div[data-testid="stAppViewBlockContainer"],
+  div[data-testid="stMainBlockContainer"] {
     max-width: 820px !important;
+    width: 820px !important;
     padding: 0 !important;
     margin: 0 auto !important;
     background: #ffffff !important;
+    box-shadow: none !important;
   }
+  /* ── Kill ALL vertical gaps & margins between widgets ── */
+  .stVerticalBlock,
+  .stVerticalBlockBorderWrapper,
+  div[data-testid="stVerticalBlock"] {
+    gap: 0 !important;
+    row-gap: 0 !important;
+  }
+  .element-container,
+  div[data-testid="element-container"] {
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+  /* ── Remove top padding Streamlit adds to the page ── */
+  div[data-testid="stAppViewContainer"] > section > div:first-child,
+  .stApp > div > div > div { padding-top: 0 !important; }
+  /* ── Column gaps ── */
+  div[data-testid="stHorizontalBlock"] { gap: 16px !important; }
   .mng-header {
     background: #000;
     color: #fff;
@@ -264,12 +288,19 @@ MANGO_CSS = """
     color: #888 !important;
   }
   hr { border: none; border-top: 1px solid #ebebeb !important; margin: 0 !important; }
-  .element-container { margin-bottom: 0 !important; }
-  div[data-testid="column"] { padding: 0 6px !important; }
+  /* Columns inner padding — mng-content handles outer */
+  div[data-testid="column"] { padding: 0 8px !important; }
   div[data-testid="column"]:first-child { padding-left: 0 !important; }
   div[data-testid="column"]:last-child  { padding-right: 0 !important; }
+  /* Expander: no extra margin */
+  div[data-testid="stExpander"] { margin: 0 !important; }
+  /* Streamlit injects a wrapping div with padding-top — nuke it */
+  div[data-testid="stVerticalBlock"] > div { padding-top: 0 !important; }
+  /* Hide Streamlit chrome */
   #MainMenu, footer, header { visibility: hidden !important; }
   .stDeployButton { display: none !important; }
+  /* Tight spacing between uploaders */
+  div[data-testid="stFileUploader"] { margin-bottom: 16px !important; }
 </style>
 """
 st.markdown(MANGO_CSS, unsafe_allow_html=True)
@@ -292,7 +323,7 @@ for k in _STATE_KEYS:
         st.session_state[k] = None
 
 # ── Usage guide ───────────────────────────────────────────────────────────────
-st.markdown('<div class="mng-content" style="padding-top:24px;">', unsafe_allow_html=True)
+st.markdown('<div style="height:20px;"></div>', unsafe_allow_html=True)
 with st.expander("Cómo usar esta herramienta", expanded=False):
     st.markdown("""
 Esta herramienta genera la configuración del sorter VDL B2B para semanas con salidas canceladas
@@ -339,7 +370,7 @@ Tras generar la Configuración DXC encontrarás el GD completo para subir a DXC/
 | `ESPECIAL DIA CAMBIO` | Se reasigna a rampas libres en el nuevo día |
 | `IRREGULAR` | Ignorada — no pasa por el GD semanal |
     """)
-st.markdown('</div>', unsafe_allow_html=True)
+st.markdown('<div style="height:4px;"></div>', unsafe_allow_html=True)
 
 # ── File upload section ───────────────────────────────────────────────────────
 st.markdown('<div class="mng-section">01 — Ficheros de entrada</div>', unsafe_allow_html=True)
