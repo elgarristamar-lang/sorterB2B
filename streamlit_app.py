@@ -49,30 +49,114 @@ for k in ["r1_gd","r1_esp","r1_can","r1_html","r2_gantt","r3_map",
     if k not in st.session_state: st.session_state[k] = None
 
 # ── Title ─────────────────────────────────────────────────────────────────────
-st.title("🏭 Sorter VDL B2B")
+st.title("Sorter VDL B2B")
 st.caption("Configurador de semanas especiales — VDL B2B")
 st.divider()
 
 # ── Guide ─────────────────────────────────────────────────────────────────────
-with st.expander("📖 Cómo usar esta herramienta"):
+with st.expander("Como usar esta herramienta"):
     st.markdown("""
-**Ficheros de entrada**
+### Que hace esta herramienta
 
-| Fichero | Oblig. | Descripción |
-|---|:---:|---|
-| `parrilla_de_salidas.xlsx` | ✅ | Columnas: `PLAYA`, `DIA_SALIDA`, `DIA_SALIDA_NEW`, `TIPO_SALIDA`, `ID_CLUSTER`. Incluir hoja `Resumen Bloques`. |
-| GRUPO_DESTINOS `.xlsx` | ✅ | Consulta DXC 9066 — Consulta destinos por zona |
-| `ramp_capacity.csv` | ✅ | CSV `;` con columnas `RAMP` y `PALLETS` |
-| Bloques horarios `.xlsx` | ⚠️ | Solo para Gantt y Sorter Map |
-| Superplayas `.xlsx` | ➖ | Opcional · `AGRUPACION_PLAYA` · `SUPERPLAYA` |
-
-**Tipos de salida:** `HABITUAL` → sin cambios · `CANCELADA` → eliminar · `ESPECIAL DIA CAMBIO` → reasignar · `IRREGULAR` → ignorar
+Genera automáticamente la configuración del **sorter VDL B2B** para semanas con salidas canceladas
+o que cambian de día (festivos, Semana Santa, etc.). A partir de la parrilla semanal y la configuración
+actual del sorter, calcula qué destinos hay que reasignar, encuentra rampas libres respetando los bloques
+horarios, y produce los ficheros listos para subir a DXC/MAR.
     """)
+
+    st.divider()
+
+    st.markdown("### Flujo de trabajo")
+    col_f1, col_f2, col_f3 = st.columns(3)
+    with col_f1:
+        st.markdown("""
+**1 · Sube los ficheros**
+
+Proporciona la parrilla semanal, la configuración actual del sorter (GRUPO_DESTINOS), y la capacidad de rampas.
+        """)
+    with col_f2:
+        st.markdown("""
+**2 · Genera la configuración**
+
+Pulsa *Configuración DXC* y la herramienta procesa las salidas, reasigna rampas y genera el fichero listo para subir.
+        """)
+    with col_f3:
+        st.markdown("""
+**3 · Descarga y sube a DXC**
+
+Descarga el GRUPO_DESTINOS generado y el resumen HTML con el análisis de ocupación por bloque.
+        """)
+
+    st.divider()
+
+    st.markdown("### Ficheros de entrada")
+
+    fi1, fi2 = st.columns(2)
+    with fi1:
+        st.markdown("""
+**Obligatorios**
+
+| Fichero | Descripcion |
+|---|---|
+| `parrilla_de_salidas.xlsx` | Parrilla semanal con columnas `PLAYA`, `DIA_SALIDA`, `DIA_SALIDA_NEW`, `TIPO_SALIDA`, `ID_CLUSTER`. Debe incluir la hoja `Resumen Bloques`. |
+| `GRUPO_DESTINOS.xlsx` | Configuracion actual del sorter. Usar consulta DXC 9066 — *Consulta destinos por zona*. |
+| `ramp_capacity.csv` | Capacidad de rampas. CSV separado por `;` con columnas `RAMP` y `PALLETS`. |
+        """)
+    with fi2:
+        st.markdown("""
+**Opcionales**
+
+| Fichero | Para que sirve |
+|---|---|
+| `bloques_horarios.xlsx` | Necesario para generar el Gantt 1H y el Sorter Map. Columnas: `NUEVO BLOQUE`, `Dia LIBERACION`, `Hora LIBERACION`, `Dia DESACTIVACION`, `Hora DESACTIVACION`. |
+| `superplayas.xlsx` | Agrupa destinos que deben ocupar rampas contiguas. Columnas: `AGRUPACION_PLAYA`, `SUPERPLAYA`. |
+        """)
+
+    st.divider()
+
+    st.markdown("### Tipos de salida en la parrilla")
+    tc1, tc2, tc3, tc4 = st.columns(4)
+    with tc1:
+        st.info("**HABITUAL** — Sin cambios. Se mantiene en el GD tal como está.")
+    with tc2:
+        st.error("**CANCELADA** — Se elimina del GD esta semana.")
+    with tc3:
+        st.warning("**ESPECIAL DIA CAMBIO** — Se reasigna a rampas libres en el nuevo día.")
+    with tc4:
+        st.markdown("**IRREGULAR** — Ignorada. No pasa por el GD semanal.")
+
+    st.divider()
+
+    st.markdown("### Outputs generados")
+    oc1, oc2, oc3 = st.columns(3)
+    with oc1:
+        st.markdown("""
+**Configuracion DXC**
+- `GRUPO_DESTINOS_SXX.xlsx` — subir a DXC/MAR
+- `_SOLO_ESPECIALES.xlsx` — solo las filas nuevas
+- `_POSTEX.csv` / `_SOREXP.csv` — importacion directa
+- `_CANCELADAS.txt` — salidas a eliminar
+- `resumen_SXX.html` — informe con grafico de ocupacion
+        """)
+    with oc2:
+        st.markdown("""
+**Gantt 1H**
+- `gantt_1h_SXX.xlsx`
+- Hojas: `LEYENDA`, `BLOQUES_DESTINOS`, `GANTT_VISUAL`, `GANTT_OPERATIVO`
+- Vista rampas x tiempo, coloreado por bloque
+        """)
+    with oc3:
+        st.markdown("""
+**Sorter Map**
+- `sorter_map_SXX.xlsx`
+- Una pestana por dia de la semana
+- Slots fisicos POSTEX coloreados por bloque
+        """)
 
 st.divider()
 
 # ── 01 · Ficheros de entrada ──────────────────────────────────────────────────
-st.subheader("📂 Ficheros de entrada")
+st.subheader("Ficheros de entrada")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -159,7 +243,7 @@ def show_log(r, expanded=False):
             else: st.text(line)
 
 # ── 02 · Generar ─────────────────────────────────────────────────────────────
-st.subheader("⚡ Generar outputs")
+st.subheader("Generar outputs")
 
 c1, c2, c3 = st.columns(3)
 with c1:
