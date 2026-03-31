@@ -307,7 +307,8 @@ def _ramp_proximity_key(r: str, anchor_numbers: set) -> int:
     return min(abs(n - a) for a in anchor_numbers)
 
 def find_free_slots(occ, capacity, n_needed,
-                    preferred_rampas=None, committed_group=None, anchor_numbers=None):
+                    preferred_rampas=None, committed_group=None, anchor_numbers=None,
+                    full_occ=None):
     """
     Asigna n_needed slots libres siguiendo esta prioridad:
 
@@ -323,6 +324,7 @@ def find_free_slots(occ, capacity, n_needed,
     """
     def get_free(r):
         if r in EXCLUDED_RAMPAS: return []
+        # Only block time-conflicting slots (full_occ is used for is_empty scoring only)
         used = set(occ.get(r, {}).keys())
         return sorted(p for p in range(1, capacity.get(r, 0) + 1) if p not in used)
 
@@ -360,7 +362,9 @@ def find_free_slots(occ, capacity, n_needed,
     def sort_key(r):
         free = get_free(r)
         if not free: return (999,) * 5
-        is_empty   = len(occ.get(r, {})) == 0
+        # is_empty = no standard entries on this rampa (ANY block, not just conflicting)
+        _any_occ = full_occ if full_occ is not None else occ
+        is_empty   = len(_any_occ.get(r, {})) == 0
         in_group   = committed_group is None or _ramp_group(r) == committed_group
         prox       = _ramp_proximity_key(r, _anchor) if _anchor else _ramp_number(r)
         mate       = pair_of(r)
@@ -372,6 +376,7 @@ def find_free_slots(occ, capacity, n_needed,
 
     pool = sorted([r for r in capacity if r not in EXCLUDED_RAMPAS and r not in tried
                    and get_free(r)], key=sort_key)
+
     for r in pool:
         if rem <= 0: break
         free = get_free(r)
@@ -477,7 +482,33 @@ def assign_especial(orig_dia, orig_playa, new_dia, raw_bloque, id_cluster,
     freed    = (all_especial_playas or set()) | freed_in_new_dia
     occ      = build_day_occ(tagged, new_dia, new_bloque, bloque_timings,
                              exclude_playas=freed, run_occ=run_occ_new_dia)
-    assigned, unmet = find_free_slots(occ, capacity, n_slots, preferred_rampas=preferred_rampas, committed_group=committed_group, anchor_numbers=anchor_numbers)
+    # full_occ: entries from blocks that overlap OR share the same physical day.
+    # Blocks sharing same day = same day-letter prefix (e.g. M for MARTES, X for MIERCOLES).
+    # This prevents especiales from taking slots used by same-day standard blocks,
+    # even if they don't conflict timewise. Falls back to occ if no bloque.
+    import re as _re_fo
+    if new_bloque:
+        _day_match = _re_fo.match(r'\d+BLO([A-Z])\d+', new_bloque or '')
+        _day_letters = {_day_match.group(1)} if _day_match else set()
+        # Also include adjacent overlapping day letter (end day of block)
+        for _bk in bloque_timings:
+            _bm = _re_fo.match(r'\d+BLO([A-Z])\d+', _bk)
+            if _bm and bloques_overlap(new_bloque, _bk, bloque_timings):
+                _day_letters.add(_bm.group(1))
+        # Build full_occ for same-day blocks
+        _full_occ_map = defaultdict(dict)
+        for _e in tagged:
+            if _e['tipo_zona'] != 'POSTEX' or _e['playa'] in freed or not _e['is_sorter']: continue
+            _eb = _e.get('bloque','') or ''
+            _ebm = _re_fo.match(r'\d+BLO([A-Z])\d+', _eb)
+            if _ebm and _ebm.group(1) in _day_letters:
+                _r, _p = parse_rampa(_e['elemento'])
+                if _r and _p and _r not in EXCLUDED_RAMPAS:
+                    _full_occ_map[_r][_p] = _eb
+        full_occ = dict(_full_occ_map)
+    else:
+        full_occ = occ
+    assigned, unmet = find_free_slots(occ, capacity, n_slots, preferred_rampas=preferred_rampas, committed_group=committed_group, anchor_numbers=anchor_numbers, full_occ=full_occ)
 
     playa_tag = orig_playa.replace('ESPANA_','')[:6].replace('_','')
     new_grupo = f"ESP_{new_dia[:3]}_{playa_tag}"[:18]
