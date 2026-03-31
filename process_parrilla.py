@@ -811,6 +811,13 @@ def _enrich_html(html, output_rows, summary):
 
 # ─── WRITE EXCEL ──────────────────────────────────────────────────────────────
 
+def _split_destino(destino):
+    """Split 10-digit destino into (id=first2, destino=last8)."""
+    d = ''.join(c for c in str(destino or '') if c.isdigit())
+    d10 = d.zfill(10) if d else '0000000000'
+    return d10[:2], d10[2:]  # id, destino
+
+
 def write_gd(output_rows, header, out_path):
     wb = Workbook(); ws = wb.active; ws.title = 'Hoja1'
     hf = PatternFill('solid', start_color='1A1A1A')
@@ -831,6 +838,35 @@ def write_gd(output_rows, header, out_path):
             c.font = df; c.border = thin
             if ci == 1: c.alignment = Alignment(horizontal='center')
     ws.freeze_panes = 'A2'
+
+    # ── POSTEX_DXC + SOREXP_DXC sheets ───────────────────────────────────────
+    # Format: DESCRIPCIÓN | DESTINO(8) | ID(2) | ELEMENTO | SECUENCIA(10)
+    dxc_headers = ['DESCRIPCIÓN', 'DESTINO', 'ID', 'ELEMENTO', 'SECUENCIA']
+    dxc_widths  = [70, 12, 6, 18, 12]
+    for sheet_name, tipo_filter in [('POSTEX_DXC', 'POSTEX'), ('SOREXP_DXC', 'SOREXP')]:
+        ws2 = wb.create_sheet(sheet_name)
+        hf2 = PatternFill('solid', start_color='1F4E79')
+        for ci, (h, w) in enumerate(zip(dxc_headers, dxc_widths), 1):
+            c = ws2.cell(row=1, column=ci, value=h)
+            c.font = Font(name='Arial', bold=True, size=9, color='FFFFFF')
+            c.fill = hf2; c.alignment = Alignment(horizontal='center')
+            ws2.column_dimensions[get_column_letter(ci)].width = w
+        ws2.row_dimensions[1].height = 18
+        ws2.freeze_panes = 'A2'
+        thin2 = Border(bottom=Side(style='thin', color='EBEBEB'))
+        df2 = Font(name='Arial', size=9)
+        ri2 = 2
+        for row in output_rows:
+            _, grupo, desc, tipo_zona, destino, almacen, elemento = row
+            if str(tipo_zona).strip().upper() != tipo_filter: continue
+            if not desc or str(desc).startswith('='): continue
+            _id, _dest = _split_destino(destino)
+            vals = [desc, _dest, _id, elemento, '10']  # secuencia always 10
+            for ci, val in enumerate(vals, 1):
+                c = ws2.cell(row=ri2, column=ci, value=val)
+                c.font = df2; c.border = thin2
+            ri2 += 1
+
     wb.save(out_path)
 
 
