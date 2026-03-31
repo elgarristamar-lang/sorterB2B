@@ -290,8 +290,8 @@ def compute_day_usage(
     playa_map: Dict[str, Dict[str, Dict[int, Set[str]]]] = defaultdict(lambda: defaultdict(lambda: defaultdict(set)))
     import re as _re_mod
     _re_playa = _re_mod.compile(
-        r"(?:DOMINGO|LUNES|MARTES|MIERCOLES|JUEVES|VIERNES|SABADO)_"
-        r"(.+?)(?:\s*\(|\s*$)", _re_mod.IGNORECASE)
+        r"(DOMINGO|LUNES|MARTES|MIERCOLES|JUEVES|VIERNES|SABADO)_(.+?)(?:\s*\(|\s*$)",
+        _re_mod.IGNORECASE)
 
     desc_col = find_col(grupo_df, ["Descripción Grupos de destino", "Descripcion Grupos de destino", "DESCRIPCION GRUPOS DE DESTINO"])
     elem_col = find_col(grupo_df, ["Elemento", "ELEMENTO"])
@@ -346,7 +346,9 @@ def compute_day_usage(
             _desc_str = str(r[desc_col])
             _playa_m = _re_playa.search(_desc_str)
             if _playa_m:
-                playa_map[block_token][sub][slot].add(_playa_m.group(1).strip())
+                _dia_desc = _playa_m.group(1).strip().upper()
+                _playa_name = _playa_m.group(2).strip()
+                playa_map[block_token][sub][slot].add((_dia_desc, _playa_name))
             # Track if this entry is an especial
             if '(ESPECIAL' in _desc_str.upper() or _desc_str.upper().endswith(' ESPECIAL'):
                 especial_usage[block_token][sub].add(slot)
@@ -375,7 +377,6 @@ def make_styles():
 def _write_playas_por_rampa(ws, all_playa_data, bold, border):
     """Sheet filtrable: día, subrampa, posición, bloque(s), playa(s)."""
     from openpyxl.styles import PatternFill as _PF, Font as _Font, Alignment as _Aln
-    from openpyxl.worksheet.table import Table, TableStyleInfo
     from openpyxl.utils import get_column_letter
 
     HEAD_FILL = _PF("solid", fgColor="1F3864")
@@ -403,16 +404,20 @@ def _write_playas_por_rampa(ws, all_playa_data, bold, border):
                 c.fill = _PF("solid", fgColor="FFFF00")
         row += 1
 
+    # Autofilter only — no Table object (avoids xlsx corruption on some Excel versions)
     if row > 2:
-        tab = Table(displayName="PlayasPorRampa",
-                    ref=f"A1:{get_column_letter(len(headers))}{row-1}")
-        tab.tableStyleInfo = TableStyleInfo(
-            name="TableStyleMedium9", showFirstColumn=False,
-            showLastColumn=False, showRowStripes=True, showColumnStripes=False)
-        ws.add_table(tab)
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{row-1}"
+        # Alternating row shading
+        from openpyxl.styles import PatternFill as _PF_alt
+        _ALT = _PF_alt("solid", fgColor="EBF0FA")
+        for ri in range(2, row):
+            is_esp = ws.cell(row=ri, column=6).value == "SÍ"
+            if is_esp: continue  # yellow already set
+            if ri % 2 == 0:
+                for ci in range(1, len(headers)+1):
+                    ws.cell(row=ri, column=ci).fill = _ALT
 
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{row-1}"
 
 
 def write_day_sheet(
@@ -491,8 +496,10 @@ def write_day_sheet(
         for bt, per_sub in playa_by_block.items():
             if not bt.startswith("_CONFLICT_"):
                 for sub, slot_map in per_sub.items():
-                    for s, playas in slot_map.items():
-                        slot_playas[sub][s].update(playas)
+                    for s, items in slot_map.items():
+                        for item in items:
+                            playa = item[1] if isinstance(item, tuple) else item
+                            slot_playas[sub][s].add(playa)
 
     # Real conflicts: slots where the assigned blocks themselves overlap in time
     conflict_slots: Dict[str, Set[int]] = defaultdict(set)
@@ -582,7 +589,8 @@ def write_day_sheet(
                 for bt, sub_map in sorted(playa_by_block.items()):
                     if bt.startswith("_CONFLICT_"): continue
                     slot_playas_bt = sub_map.get(sub, {}).get(slot, set())
-                    for playa in sorted(slot_playas_bt):
+                    for item in sorted(slot_playas_bt):
+                        dia_d, playa = item if isinstance(item, tuple) else ('', item)
                         is_esp_playa = slot in especial_by_block.get(bt, {}).get(sub, set()) if especial_by_block else False
                         label = f"{bt}: {playa}" + (" ★" if is_esp_playa else "")
                         tooltip_lines.append(label)
@@ -636,6 +644,84 @@ def write_day_sheet(
         f"SORTER MAP - {day_name} (agrega {day_code}0..{day_code}5) | slots POSTEX  "
         f"│  Regulares: {regular_slots_total}  │  Especiales: {especial_slots_total}"
     )
+
+
+    # ── Side table: especiales resumen ──────────────────────────────────────
+    if playa_by_block and especial_by_block:
+        from openpyxl.styles import PatternFill as _PF2, Font as _F2, Alignment as _A2
+        SIDE_HEAD_FILL = _PF2("solid", fgColor="1F3864")
+        SIDE_HEAD_FONT = _F2(bold=True, color="FFFFFF", size=9)
+        SIDE_ESP_FILL  = _PF2("solid", fgColor="FFFF00")
+        SIDE_REG_FILL  = _PF2("solid", fgColor="FFFFFF")
+        _center = Alignment(horizontal="center", vertical="center", wrap_text=False)
+        _left   = Alignment(horizontal="left",   vertical="center", wrap_text=False)
+        _wrap   = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+
+        # Build: {(block_token, playa): [(sub, slot), ...]}
+        from collections import defaultdict as _dd
+        import re as _re
+        esp_playa_slots = _dd(lambda: _dd(list))  # [playa] -> [block] -> [(sub,slot)]
+
+        for bt, sub_map in playa_by_block.items():
+            if bt.startswith("_CONFLICT_"): continue
+            is_esp_bt = bt in especial_by_block
+            for sub, slot_map in sub_map.items():
+                for slot, playas in slot_map.items():
+                    is_esp_slot = is_esp_bt and slot in especial_by_block.get(bt, {}).get(sub, set())
+                    if not is_esp_slot: continue
+                    for item in playas:
+                        dia_d, playa = item if isinstance(item, tuple) else ('', item)
+                        esp_playa_slots[playa][bt].append((sub, slot, dia_d))
+
+        if esp_playa_slots:
+            # Column positions: gap after MULTI_BLOQUE
+            SC = multi_col_idx + 2  # start col for side table
+
+            # Set column widths
+            ws.column_dimensions[get_column_letter(SC)].width     = 10   # DÍA_NEW
+            ws.column_dimensions[get_column_letter(SC+1)].width   = 34   # PLAYA
+            ws.column_dimensions[get_column_letter(SC+2)].width   = 10   # BLOQUE
+            ws.column_dimensions[get_column_letter(SC+3)].width   = 55   # POSICIONES
+
+            # Header row at row 2
+            for ci, hdr in enumerate(["DÍA", "PLAYA ESPECIAL", "BLOQUE", "POSICIONES"], SC):
+                c = ws.cell(row=2, column=ci, value=hdr)
+                c.fill = SIDE_HEAD_FILL; c.font = SIDE_HEAD_FONT
+                c.alignment = _center; c.border = border
+
+            # Merge title across side table
+            ws.cell(row=1, column=SC, value="ESPECIALES — RESUMEN DE ASIGNACIÓN")
+            ws.cell(row=1, column=SC).font = _F2(bold=True, size=10, color="1F3864")
+            ws.cell(row=1, column=SC).alignment = _center
+            try:
+                ws.merge_cells(start_row=1, start_column=SC, end_row=1, end_column=SC+3)
+            except Exception: pass
+
+            # Data rows — sorted by playa name
+            sr = 3
+            for playa in sorted(esp_playa_slots.keys()):
+                bt_map = esp_playa_slots[playa]
+                for bt in sorted(bt_map.keys()):
+                    slots_list = sorted(bt_map[bt], key=lambda x: (x[0], x[1]))
+                    # Compact positions: R04A[1,2,3] · R04B[5,6]
+                    by_sub = _dd(list)
+                    dia_display = day_name
+                    for entry in slots_list:
+                        sub, slot = entry[0], entry[1]
+                        if len(entry) > 2 and entry[2]: dia_display = entry[2]
+                        by_sub[sub].append(slot)
+                    pos_str = " · ".join(
+                        f"{sub}[{','.join(str(s) for s in sorted(slots))}]"
+                        for sub, slots in sorted(by_sub.items(), key=lambda x: ramp_sort_key(x[0]))
+                    )
+                    vals = [dia_display, playa, bt, pos_str]
+                    alns = [_center, _left, _center, _wrap]
+                    for ci, (val, aln) in enumerate(zip(vals, alns), SC):
+                        c = ws.cell(row=sr, column=ci, value=val)
+                        c.fill = SIDE_ESP_FILL; c.border = border; c.alignment = aln
+                        c.font = _F2(size=8, italic=(ci == SC))
+                    ws.row_dimensions[sr].height = 26
+                    sr += 1
 
     ws.freeze_panes = "B3"
 
@@ -1222,7 +1308,9 @@ def main():
                 _playas = set()
                 for _bt, _sub_map in playa_by_block.items():
                     if not _bt.startswith("_CONFLICT_") and _sl in _sub_map.get(_sub, {}):
-                        _playas.update(_sub_map[_sub][_sl])
+                        for _item in _sub_map[_sub][_sl]:
+                            _p = _item[1] if isinstance(_item, tuple) else _item
+                            _playas.add(_p)
                 _is_esp = _sl in _esp_sub.get(_sub, set())
                 all_playa_data.append((
                     day_name, _sub, _sl,
