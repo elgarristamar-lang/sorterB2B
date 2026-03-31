@@ -45,7 +45,7 @@ CAPACITY_CSV, GRUPO_XLSX, BLOQUES_XLSX, _OUTPUT_PATH_ARG, GRUPO_SHEET = _parse_a
 EXCLUDE_PREFIXES = ("R01", "R03")  # rampas no utilizables
 MAX_POS_COL_WIDTH = 4
 SUBRAMPA_COL_WIDTH = 11
-MULTI_COL_WIDTH = 45  # columna extra
+MULTI_COL_WIDTH = 80  # columna extra (includes playa names for multi-block slots)
 
 
 # -----------------------------
@@ -542,6 +542,7 @@ def write_day_sheet(
 
         # paint used slots + put BLOCK text
         multi_details: List[str] = []  # "pos 02: J1+J2"
+        _multi_acc: dict = {}  # (bt, playa) → [slots] for compact summary
         sub_conflicts = conflict_slots.get(sub, set())
 
         for slot, blocks_here in sorted(slot_blocks.get(sub, {}).items(), key=lambda x: x[0]):
@@ -573,7 +574,16 @@ def write_day_sheet(
                     cell.value = blocks_sorted[0] + "+" + blocks_sorted[1]
                 else:
                     cell.value = blocks_sorted[0] + f"+{len(blocks_sorted)-1}"
-                multi_details.append(f"pos {slot:02d}: " + "+".join(blocks_sorted))
+                # Accumulate multi-block slot info for compact summary
+                if playa_by_block:
+                    for _bt in blocks_sorted:
+                        _items = playa_by_block.get(_bt, {}).get(sub, {}).get(slot, set())
+                        for _item in sorted(_items):
+                            _dia, _pl = _item if isinstance(_item, tuple) else ('', _item)
+                            _key = (_bt, _pl)
+                            _multi_acc.setdefault(_key, []).append(slot)
+                else:
+                    multi_details.append(f"pos {slot:02d}: {'+'.join(blocks_sorted)}")
 
             # Also paint conflict slots not yet in slot_blocks
             cell.alignment = center
@@ -582,26 +592,35 @@ def write_day_sheet(
             n_blocks = len(blocks_here) if slot not in conflict_slots.get(sub, set()) else 2
             is_esp_slot = slot in esp_sub_slots.get(sub, set())
             cell.font = Font(bold=True, italic=is_esp_slot, size=7 if n_blocks > 1 else 9)
-            # Tooltip: playa name(s)
-            # Build tooltip: "BLOCK: PLAYA_NAME [ESPECIAL]" per block occupying this slot
-            tooltip_lines = []
-            if playa_by_block:
-                for bt, sub_map in sorted(playa_by_block.items()):
-                    if bt.startswith("_CONFLICT_"): continue
-                    slot_playas_bt = sub_map.get(sub, {}).get(slot, set())
-                    for item in sorted(slot_playas_bt):
-                        dia_d, playa = item if isinstance(item, tuple) else ('', item)
-                        is_esp_playa = slot in especial_by_block.get(bt, {}).get(sub, set()) if especial_by_block else False
-                        label = f"{bt}: {playa}" + (" ★" if is_esp_playa else "")
-                        tooltip_lines.append(label)
-            if tooltip_lines:
-                cell.comment = Comment("\n".join(tooltip_lines), "SorterMap")
+            # Tooltip only for single-block cells (multi-block info is in MULTI_BLOQUE column)
+            if len(blocks_here) == 1 and slot not in conflict_slots.get(sub, set()) and playa_by_block:
+                _tip_lines = []
+                for _bt, _sub_map in sorted(playa_by_block.items()):
+                    if _bt.startswith("_CONFLICT_"): continue
+                    for _item in sorted(_sub_map.get(sub, {}).get(slot, set())):
+                        _dia, _pl = _item if isinstance(_item, tuple) else ('', _item)
+                        _pl_t = _pl[:32] + '…' if len(_pl) > 33 else _pl
+                        _tip_lines.append(_pl_t)
+                if _tip_lines:
+                    _cmt = Comment("\n".join(_tip_lines), "")
+                    # Size in pixels: ~8px per char width, ~22px per line height
+                    _cmt.width  = max(300, min(max(len(l) for l in _tip_lines) * 8, 480))
+                    _cmt.height = max(40, len(_tip_lines) * 22 + 16)
+                    cell.comment = _cmt
 
         # (evicted blocks are noted in MULTI column but don't paint cells red)
 
-        # Add evicted blocks info to MULTI column
-        evicted = evicted_details.get(sub, [])
-        all_details = multi_details + evicted
+        # Compact: one line per block → playa (no slot detail)
+        if _multi_acc:
+            _seen = {}
+            for (_bt, _pl) in sorted(_multi_acc.keys()):
+                if _bt not in _seen:
+                    _pl_short = _pl[:30] + '…' if len(_pl) > 31 else _pl
+                    multi_details.append(f"{_bt} = {_pl_short}")
+                    _seen[_bt] = _pl_short
+
+        # Evicted blocks ("desplazado") removed — noise, real conflicts shown in red
+        all_details = multi_details
 
         # rellenar columna MULTI_BLOQUE + comentario
         if all_details:
