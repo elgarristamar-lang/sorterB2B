@@ -54,7 +54,7 @@ st.caption("Configurador de semanas especiales — VDL B2B")
 st.divider()
 
 # ── Guide ─────────────────────────────────────────────────────────────────────
-with st.expander("Como usar esta herramienta"):
+with st.expander("Guia de uso", expanded=False):
     st.markdown("""
 ### Que hace esta herramienta
 
@@ -356,7 +356,7 @@ if st.session_state["r1_gd"] is not None:
                                mime=XLSX_MIME, use_container_width=True)
             st.caption("Filas nuevas a añadir en DXC")
 
-    with st.expander("📥 Más descargas — CSV · Canceladas · HTML"):
+    with st.expander("Mas descargas: CSV, Canceladas, HTML"):
         st.markdown("**CSV para importar en DXC**")
         cc1,cc2,cc3,cc4 = st.columns(4)
         for col,key,lbl in [(cc1,"r1_postex_csv","POSTEX completo"),
@@ -383,7 +383,7 @@ if st.session_state["r1_gd"] is not None:
                                    mime="text/html", use_container_width=True)
                 st.caption("Informe interactivo con gráfico de capacidad")
 
-    with st.expander("🔍 Filtrar por día y regenerar"):
+    with st.expander("Filtrar por dia y regenerar"):
         sel = st.multiselect("Días a incluir", options=ALL_DAYS, default=[],
                              key="day_filter_sel", placeholder="Selecciona días…")
         if st.button("⚙️ Regenerar con filtro", key="regen_filter",
