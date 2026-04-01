@@ -587,18 +587,21 @@ def load_especial_bloque_map(parrilla_path):
             if result:
                 return result
 
-        # --- S18 format: derive bloque from ID_CLUSTER_NEW + Resumen Bloques ---
-        # Build cluster→bloque map
+        # --- S18 format: derive bloque from the cluster part that CHANGED ---
+        # ID_CLUSTER_NEW = ID_CLUSTER with the old day's cluster replaced by new day's
+        # The new special block is the part in ID_CLUSTER_NEW not present in ID_CLUSTER
         _cb = {}
         if 'Resumen Bloques' in wb.sheetnames:
             for _r in wb['Resumen Bloques'].iter_rows(values_only=True):
                 if _r[0] and _r[1] and str(_r[0]).strip() not in ('Bloque', ''):
                     _cb[str(_r[1]).strip().upper()] = str(_r[0]).strip()
 
-        def _c2b(cluster_str):
-            for part in str(cluster_str or '').strip().upper().split('-'):
-                if part in _cb: return _cb[part]
-            return ''
+        def _get_new_cluster(id_cluster, id_cluster_new):
+            """The new special block = the part in ID_CLUSTER_NEW not in ID_CLUSTER."""
+            old_parts = set(str(id_cluster or '').upper().split('-'))
+            new_parts = str(id_cluster_new or '').upper().split('-')
+            changed = [p for p in new_parts if p not in old_parts]
+            return changed[0] if changed else (new_parts[-1] if new_parts else '')
 
         # Find parrilla sheet (has TIPO_SALIDA + DIA_PLAYA_NEW)
         par_sheet = next((s for s in wb.sheetnames
@@ -615,13 +618,17 @@ def load_especial_bloque_map(parrilla_path):
                 tipo = str(r[col2.get('TIPO_SALIDA', 10)] or '').strip().upper()
                 if 'ESPECIAL DIA CAMBIO' not in tipo: continue
                 if 'CANCELADA' in tipo: continue
-                dia_new = str(r[col2.get('DIA_SALIDA_NEW', 4)] or '').strip().upper()
-                dpn = str(r[col2.get('DIA_PLAYA_NEW', 1)] or '').strip()
-                cluster_new = str(r[col2.get('ID_CLUSTER_NEW', 9)] or '').strip()
-                bloque = _c2b(cluster_new)
+                dia_new        = str(r[col2.get('DIA_SALIDA_NEW', 4)] or '').strip().upper()
+                dpn            = str(r[col2.get('DIA_PLAYA_NEW', 1)] or '').strip()
+                id_cluster     = str(r[col2.get('ID_CLUSTER', 8)] or '').strip()
+                id_cluster_new = str(r[col2.get('ID_CLUSTER_NEW', 9)] or '').strip()
                 m = _DAY_PFX.match(dpn)
                 playa = dpn[m.end():].strip() if m else str(r[col2.get('AGRUPACION_PLAYA', 3)] or '').strip()
-                if playa and dia_new and bloque:
+                if not playa or not dia_new: continue
+                # New block = the cluster part that changed (not in original ID_CLUSTER)
+                new_cluster = _get_new_cluster(id_cluster, id_cluster_new)
+                bloque = _cb.get(new_cluster.upper(), '')
+                if bloque:
                     result[(dia_new, playa)] = bloque
     except Exception as e:
         print(f"Warning: could not load especial bloque map: {e}")
@@ -756,17 +763,26 @@ def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, fi
         _is_na = not _raw_bloque or str(_raw_bloque).strip().upper() in ('#N/A','N/A','NONE','NO_BLOQUE','')
         if _is_na and especial_bloque_map:
             _raw_bloque = especial_bloque_map.get((dia_new.upper(), playa), _raw_bloque)
-        new_rows, info = assign_especial(
-            dia_orig, playa, dia_new,
-            _raw_bloque, record['id_cluster'],
-            by_dia_playa, tagged, capacity, bloque_timings,
-            freed_per_day.get(dia_new, set()),
-            run_occ.get(dia_new, {}),
-            preferred_rampas=pref_rampas,
-            all_especial_playas=all_esp_playas,
-            committed_group=cg,
-            anchor_numbers=an,
-        )
+        # S18: _raw_bloque may be "2BLOL0,4BLOX3" — run assign_especial for each bloque
+        _raw_bloques = [b.strip() for b in str(_raw_bloque).split(',') if b.strip()]
+        if not _raw_bloques:
+            _raw_bloques = ['']
+        new_rows, info = [], {'status': 'NO_CONFIG', 'rampas': {}}
+        for _single_bloque in _raw_bloques:
+            _rows_b, _info_b = assign_especial(
+                dia_orig, playa, dia_new,
+                _single_bloque, record['id_cluster'],
+                by_dia_playa, tagged, capacity, bloque_timings,
+                freed_per_day.get(dia_new, set()),
+                run_occ.get(dia_new, {}),
+                preferred_rampas=pref_rampas,
+                all_especial_playas=all_esp_playas,
+                committed_group=cg,
+                anchor_numbers=an,
+            )
+            new_rows.extend(_rows_b)
+            if _info_b.get('status') == 'OK':
+                info = _info_b  # keep last OK info for tracking
         # Update sibling proximity tracking
         if info.get('status') == 'OK' and info.get('rampas'):
             used_rampas = set(info['rampas'].keys())
@@ -1264,7 +1280,7 @@ def main():
     if nocfg:
         print("\n❌ Sin config GD:")
         for r in nocfg:
-            print(f"  {r['playa']:42s} sin datos en ningún día")
+            print(f"  {r.get('playa', r.get('orig_playa','?')):42s} sin datos en ningún día")
 
     if partial:
         print("\n⚠ Parciales:")
