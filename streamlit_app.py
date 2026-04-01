@@ -1,4 +1,4 @@
-# Version: 0.06 — rollback to v0.05 + instrucciones
+# Version: 0.06
 import streamlit as st
 import subprocess, sys, tempfile, datetime as dt
 from pathlib import Path
@@ -6,6 +6,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).parent
 
 def gd_to_dxc_csv(xlsx_bytes):
+    # Convert GD xlsx to DXC upload CSV format (POSTEX + SOREXP separately)
     import io as _io
     from openpyxl import load_workbook as _lwb
     wb = _lwb(_io.BytesIO(xlsx_bytes), read_only=True)
@@ -36,54 +37,6 @@ st.markdown("## 🏭 Sorter VDL B2B")
 st.markdown("Configurador de semanas especiales — VDL B2B")
 st.divider()
 
-# ── Instrucciones ─────────────────────────────────────────────────────────────
-st.markdown("### Que hace esta herramienta")
-st.markdown("""
-Genera la configuración del sorter VDL B2B para semanas con salidas canceladas o que cambian de día
-(festivos, Semana Santa, etc.). A partir de la parrilla semanal y el GRUPO_DESTINOS actual, calcula
-qué destinos reasignar, encuentra rampas libres respetando los bloques horarios, y produce los ficheros
-listos para subir a DXC/MAR.
-""")
-
-col_a, col_b, col_c = st.columns(3)
-with col_a:
-    st.markdown("**1 · Sube los ficheros**")
-    st.caption("Parrilla semanal, GRUPO_DESTINOS actual y capacidad de rampas. Los bloques horarios son necesarios solo para Gantt y Sorter Map.")
-with col_b:
-    st.markdown("**2 · Genera la configuracion**")
-    st.caption("Pulsa *Configuracion DXC* y la herramienta procesa las salidas, reasigna rampas y genera el fichero.")
-with col_c:
-    st.markdown("**3 · Descarga y sube a DXC**")
-    st.caption("Descarga el GRUPO_DESTINOS generado y el resumen HTML con el analisis de ocupacion por bloque.")
-
-st.divider()
-st.markdown("**Ficheros de entrada**")
-
-col_fi1, col_fi2 = st.columns(2)
-with col_fi1:
-    st.markdown("""
-| Fichero | Oblig. |
-|---|:---:|
-| `parrilla_de_salidas.xlsx` | ✅ |
-| `GRUPO_DESTINOS.xlsx` (consulta DXC 9066) | ✅ |
-| `ramp_capacity.csv` | ✅ |
-| `bloques_horarios.xlsx` | ⚠️ Gantt/Map |
-| `superplayas.xlsx` | ➖ opcional |
-""")
-with col_fi2:
-    st.markdown("""
-**Tipos de salida en la parrilla**
-
-| Tipo | Accion |
-|---|---|
-| `HABITUAL` | Sin cambios |
-| `CANCELADA` | Se elimina del GD |
-| `ESPECIAL DIA CAMBIO` | Se reasigna a rampas libres |
-| `IRREGULAR` | Ignorada |
-""")
-
-st.divider()
-
 # ── Session state ─────────────────────────────────────────────────────────────
 for key in ["r1_gd","r1_esp","r1_can","r1_html","r2_gantt","r3_map","r1_day_filter","r1_postex_csv","r1_sorexp_csv","r1_esp_postex_csv","r1_esp_sorexp_csv"]:
     if key not in st.session_state:
@@ -94,22 +47,53 @@ st.markdown("### Ficheros de entrada")
 col1, col2 = st.columns(2)
 with col1:
     f_parrilla = st.file_uploader("Parrilla de salidas", type=["xlsx"],
-                                   help="parrilla_de_salidas.xlsx — debe incluir la hoja Resumen Bloques")
-    sheet  = st.text_input("Nombre de hoja", value="parrilla_test_s14")
-    semana = st.text_input("Semana", value="S14")
+                                   help="Debe incluir la hoja Resumen Bloques")
+
+    # Dynamic sheet selector: read sheets from uploaded file
+    if f_parrilla:
+        import io as _io2
+        from openpyxl import load_workbook as _lwb2
+        _wb_tmp = _lwb2(_io2.BytesIO(f_parrilla.read()), read_only=True)
+        f_parrilla.seek(0)
+        # Filter to relevant sheets: those with TIPO_SALIDA column (parrilla sheets)
+        _all_sheets = _wb_tmp.sheetnames
+        _valid = []
+        for _sh in _all_sheets:
+            _ws_tmp = _wb_tmp[_sh]
+            _first = next(_ws_tmp.iter_rows(values_only=True, max_row=1), None)
+            if _first and any(str(h or "").strip().upper() in ("PLAYA","TIPO_SALIDA","DIA_PLAYA_NEW")
+                              for h in _first):
+                _valid.append(_sh)
+        _options = _valid if _valid else _all_sheets
+        # Pick best default: prefer parrilla_test_* sheets
+        _default_idx = next(
+            (i for i, s in enumerate(_options) if s.lower().startswith("parrilla_test")), 0
+        )
+        sheet = st.selectbox("Hoja de parrilla", options=_options, index=_default_idx,
+                             help="Selecciona la pestaña con los datos de la semana")
+    else:
+        sheet = st.text_input("Nombre de hoja", value="parrilla_test_s14",
+                              help="Sube la parrilla para ver las hojas disponibles")
+
+    # Auto-detect semana from sheet name (parrilla_test_s18 → S18)
+    import re as _re_sh
+    _m_sem = _re_sh.search(r's([0-9]+)', sheet.lower())
+    _sem_default = f"S{_m_sem.group(1).upper()}" if _m_sem else "S14"
+    semana = st.text_input("Semana", value=_sem_default,
+                           help="Se autodetecta del nombre de hoja")
 with col2:
     f_gd  = st.file_uploader("GRUPO_DESTINOS", type=["xlsx"],
-                               help="Consulta personalizada DXC 9066 — Consulta destinos por zona")
+                               help="Export DXC o fichero clásico")
     f_cap = st.file_uploader("Capacidad de rampas", type=["csv"],
                                help="CSV con columnas RAMP;PALLETS")
 
 f_bloques = st.file_uploader(
     "Bloques horarios *(necesario para Gantt y Sorter Map)*", type=["xlsx"],
-    help="Columnas: NUEVO BLOQUE · Dia LIBERACION · Hora LIBERACION · Dia DESACTIVACION · Hora DESACTIVACION")
+    help="Columnas: NUEVO BLOQUE · Día LIBERACIÓN · Hora LIBERACIÓN · Día DESACTIVACIÓN · Hora DESACTIVACIÓN")
 
 f_superplaya = st.file_uploader(
-    "Superplayas *(opcional)*", type=["xlsx"],
-    help="Columnas: AGRUPACION_PLAYA · SUPERPLAYA — define que destinos deben ir juntos en rampas contiguas")
+    "Superplayas *(opcional — mejora la agrupación de rampas)*", type=["xlsx"],
+    help="Columnas: AGRUPACION_PLAYA · SUPERPLAYA — define qué destinos deben ir juntos en rampas contiguas")
 
 st.divider()
 
@@ -138,9 +122,9 @@ def run_gd(p, tmp, sc, days_arg=""):
     cmd  = [sys.executable, str(BASE_DIR / "process_parrilla.py"),
             str(p["parrilla"]), str(p["gd"]), str(p["cap"]),
             sheet.strip(), sc, str(gd), str(html)]
-    cmd.append(days_arg)
+    cmd.append(days_arg)  # argv[8] — always pass (empty string = no filter)
     if "superplaya" in p:
-        cmd.append(str(p["superplaya"]))
+        cmd.append(str(p["superplaya"]))  # argv[9]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     return gd, html, r
 
@@ -164,10 +148,11 @@ vis_ok  = bool(base_ok and f_bloques)
 
 b1, b2, b3 = st.columns(3)
 with b1:
-    st.markdown("**1 · Configuracion DXC**")
+    st.markdown("**1 · Configuración DXC**")
     st.caption("GRUPO_DESTINOS + resumen HTML")
-    if st.button("Generar", key="go1", type="primary",
+    if st.button("⚙️ Generar", key="go1", type="primary",
                  disabled=not base_ok, use_container_width=True):
+        # Clear previous results so we re-run
         for k in ["r1_gd","r1_esp","r1_can","r1_html","r1_day_filter"]:
             st.session_state[k] = None
         st.session_state["_run1"] = True
@@ -176,23 +161,23 @@ with b1:
 
 with b2:
     st.markdown("**2 · Gantt 1H**")
-    st.caption("Visual bloques x rampas x hora")
-    if st.button("Generar", key="go2", type="primary",
+    st.caption("Visual bloques × rampas × hora")
+    if st.button("📊 Generar", key="go2", type="primary",
                  disabled=not vis_ok, use_container_width=True):
         st.session_state["r2_gantt"] = None
         st.session_state["_run2"] = True
     if not vis_ok:
-        st.caption("_Requiere tambien bloques horarios_")
+        st.caption("_Requiere también bloques horarios_")
 
 with b3:
-    st.markdown("**3 · Sorter Map por dia**")
-    st.caption("1 pestana por dia, slots fisicos")
-    if st.button("Generar", key="go3", type="primary",
+    st.markdown("**3 · Sorter Map por día**")
+    st.caption("1 pestaña por día, slots físicos")
+    if st.button("🗺 Generar", key="go3", type="primary",
                  disabled=not vis_ok, use_container_width=True):
         st.session_state["r3_map"] = None
         st.session_state["_run3"] = True
     if not vis_ok:
-        st.caption("_Requiere tambien bloques horarios_")
+        st.caption("_Requiere también bloques horarios_")
 
 st.divider()
 
@@ -207,7 +192,7 @@ if st.session_state.get("_run1"):
             gd, html, r = run_gd(p, tmp, sc)
         show_log(r)
         if r.returncode != 0 or not gd.exists():
-            st.error("El proceso termino con error.")
+            st.error("El proceso terminó con error.")
         else:
             esp_path = Path(str(gd).replace('.xlsx', '_SOLO_ESPECIALES.xlsx'))
             can_path = Path(str(gd).replace('.xlsx', '_CANCELADAS.txt'))
@@ -223,7 +208,7 @@ if st.session_state.get("_run1"):
                 st.session_state["r1_esp_sorexp_csv"] = (esp_path.stem + "_SOREXP.csv", _esx)
             st.session_state["r1_can"]   = (can_path.name, can_path.read_text(encoding='utf-8')) if can_path.exists() else None
             st.session_state["r1_html"]  = (html.name,  html.read_bytes()) if html.exists() else None
-            st.session_state["r1_day_filter"] = None
+            st.session_state["r1_day_filter"] = None  # full run, no day filter
 
 # ── Execute action 2 ──────────────────────────────────────────────────────────
 if st.session_state.get("_run2"):
@@ -248,7 +233,7 @@ if st.session_state.get("_run2"):
             if r.returncode == 0 and out.exists():
                 st.session_state["r2_gantt"] = (out.name, out.read_bytes())
             else:
-                st.error("El Gantt termino con error.")
+                st.error("El Gantt terminó con error.")
 
 # ── Execute action 3 ──────────────────────────────────────────────────────────
 if st.session_state.get("_run3"):
@@ -269,6 +254,7 @@ if st.session_state.get("_run3"):
                     sys.executable, str(BASE_DIR / "sorter_map_por_dia.py"),
                     str(p["cap"]), str(gd), str(p["bloques"]), str(out), "Hoja1",
                 ]
+                # Optional validation: pass parrilla + orig GD paths
                 if "parrilla" in p and "gd" in p:
                     _sorter_cmd += [str(p["parrilla"]), sheet.strip(), str(p["gd"])]
                 r = subprocess.run(_sorter_cmd, capture_output=True, text=True, timeout=180)
@@ -276,23 +262,24 @@ if st.session_state.get("_run3"):
             if r.returncode == 0 and out.exists():
                 st.session_state["r3_map"] = (out.name, out.read_bytes())
             else:
-                st.error("El Sorter Map termino con error.")
+                st.error("El Sorter Map terminó con error.")
 
 # ── Show results action 1 ─────────────────────────────────────────────────────
 if st.session_state["r1_gd"] is not None:
     gd_name, gd_bytes = st.session_state["r1_gd"]
     sc = semana.strip() or sheet.strip().upper()
-    st.success(f"Configuracion {sc} generada")
+    st.success(f"✓ Configuración {sc} generada")
 
-    with st.expander("Filtrar por dia y regenerar especiales"):
+    # ── Day filter for filtered re-extraction ──
+    with st.expander("🔍 Filtrar por día y regenerar especiales"):
         selected_days = st.multiselect(
-            "Dias a incluir en el GD filtrado",
+            "Días a incluir en el GD filtrado",
             options=ALL_DAYS,
             default=[],
             key="day_filter_sel",
-            placeholder="Selecciona dias…",
+            placeholder="Selecciona días…",
         )
-        if st.button("Regenerar con filtro", key="regen_filter",
+        if st.button("⚙️ Regenerar con filtro", key="regen_filter",
                      disabled=not (selected_days and f_parrilla and f_gd and f_cap)):
             days_arg = ",".join(selected_days)
             with tempfile.TemporaryDirectory() as _tmp:
@@ -310,53 +297,57 @@ if st.session_state["r1_gd"] is not None:
                     st.session_state["r1_day_filter"] = selected_days
                     st.rerun()
                 else:
-                    st.error("Error en regeneracion.")
+                    st.error("Error en regeneración.")
                     show_log(r, expanded=True)
 
+    # Day filter badge
     if st.session_state["r1_day_filter"]:
         st.info(f"Filtrado a: {', '.join(st.session_state['r1_day_filter'])}")
 
+    # Downloads row 1: GD completo + solo especiales
     c1, c2 = st.columns(2)
     with c1:
         name, data = st.session_state["r1_gd"]
-        st.download_button("GD completo (.xlsx)", data=data, file_name=name,
+        st.download_button("⬇️ GD completo", data=data, file_name=name,
                            mime=XLSX_MIME, use_container_width=True)
-        st.caption("Subir a DXC / MAR")
+        st.caption("GD completo — subir a DXC / MAR")
     with c2:
         if st.session_state["r1_esp"]:
             name, data = st.session_state["r1_esp"]
-            st.download_button("Solo especiales (.xlsx)", data=data, file_name=name,
+            st.download_button("⬇️ Solo especiales", data=data, file_name=name,
                                mime=XLSX_MIME, use_container_width=True)
             st.caption("Solo filas nuevas a añadir en DXC")
 
+    # CSV DXC format downloads
     st.markdown("**Formato CSV para importar en DXC:**")
     c5, c6, c7, c8 = st.columns(4)
     with c5:
         if st.session_state["r1_postex_csv"]:
             name, data = st.session_state["r1_postex_csv"]
-            st.download_button("POSTEX completo", data=data, file_name=name,
+            st.download_button("⬇️ POSTEX completo", data=data, file_name=name,
                                mime="text/csv", use_container_width=True)
     with c6:
         if st.session_state["r1_sorexp_csv"]:
             name, data = st.session_state["r1_sorexp_csv"]
-            st.download_button("SOREXP completo", data=data, file_name=name,
+            st.download_button("⬇️ SOREXP completo", data=data, file_name=name,
                                mime="text/csv", use_container_width=True)
     with c7:
         if st.session_state["r1_esp_postex_csv"]:
             name, data = st.session_state["r1_esp_postex_csv"]
-            st.download_button("POSTEX especiales", data=data, file_name=name,
+            st.download_button("⬇️ POSTEX especiales", data=data, file_name=name,
                                mime="text/csv", use_container_width=True)
     with c8:
         if st.session_state["r1_esp_sorexp_csv"]:
             name, data = st.session_state["r1_esp_sorexp_csv"]
-            st.download_button("SOREXP especiales", data=data, file_name=name,
+            st.download_button("⬇️ SOREXP especiales", data=data, file_name=name,
                                mime="text/csv", use_container_width=True)
 
+    # Downloads row 2: canceladas + resumen HTML
     c3, c4 = st.columns(2)
     with c3:
         if st.session_state["r1_can"]:
             name, txt = st.session_state["r1_can"]
-            st.download_button("Canceladas.txt", data=txt, file_name=name,
+            st.download_button("⬇️ Canceladas.txt", data=txt, file_name=name,
                                mime="text/plain", use_container_width=True)
             with st.expander("Ver canceladas"):
                 st.text(txt)
@@ -364,25 +355,25 @@ if st.session_state["r1_gd"] is not None:
     with c4:
         if st.session_state["r1_html"]:
             name, data = st.session_state["r1_html"]
-            st.download_button("Resumen HTML", data=data, file_name=name,
+            st.download_button("⬇️ Resumen HTML", data=data, file_name=name,
                                mime="text/html", use_container_width=True)
-            st.caption("Informe con grafico interactivo")
+            st.caption("Informe con gráfico interactivo")
 
 # ── Show results action 2 ─────────────────────────────────────────────────────
 if st.session_state["r2_gantt"] is not None:
     name, data = st.session_state["r2_gantt"]
-    st.success("Gantt 1H generado")
-    st.download_button("Gantt 1H.xlsx", data=data, file_name=name,
+    st.success("✓ Gantt 1H generado")
+    st.download_button("⬇️ Gantt 1H.xlsx", data=data, file_name=name,
                        mime=XLSX_MIME, use_container_width=True)
     st.caption("Hojas: LEYENDA · BLOQUES_DESTINOS · GANTT_VISUAL · GANTT_OPERATIVO")
 
 # ── Show results action 3 ─────────────────────────────────────────────────────
 if st.session_state["r3_map"] is not None:
     name, data = st.session_state["r3_map"]
-    st.success("Sorter Map generado")
-    st.download_button("Sorter Map.xlsx", data=data, file_name=name,
+    st.success("✓ Sorter Map generado")
+    st.download_button("⬇️ Sorter Map.xlsx", data=data, file_name=name,
                        mime=XLSX_MIME, use_container_width=True)
-    st.caption("Hojas: DOM · LUN · MAR · MIE · JUE · VIE · SAB · LEYENDA")
+    st.caption("Hojas: DOM · LUN · MAR · MIÉ · JUE · VIE · SÁB · LEYENDA")
 
 st.divider()
 st.caption("v0.06 · VDL B2B · Estrictamente confidencial")
