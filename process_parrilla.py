@@ -213,17 +213,21 @@ def load_parrilla(path, sheet_name):
         raise ValueError(f"Hoja '{sheet_name}' no encontrada. Disponibles: {', '.join(wb.sheetnames)}")
     ws = wb[sheet_name]
     all_rows = list(ws.iter_rows(values_only=True))
-    col = {str(h): i for i, h in enumerate(all_rows[0]) if h}
+    col = {str(h).strip().upper(): i for i, h in enumerate(all_rows[0]) if h}
     records = []
     for row in all_rows[1:]:
         def g(c, d=''):
             i = col.get(c)
             return safe_str(row[i]) if i is not None and row[i] is not None else d
-        r = {'dia_playa': g('DIA_PLAYA'), 'playa': g('PLAYA'),
-             'dia_salida': g('DIA_SALIDA'), 'cutoff': g('CUTOFF'),
+        r = {'dia_playa': g('DIA_PLAYA') or g('DIA_PLAYA_NEW'),
+             'playa': g('PLAYA') or g('AGRUPACION_PLAYA'),
+             'dia_salida': g('DIA_SALIDA') or g('DIA_SALIDA_ORIGINAL'),
+             'cutoff': g('CUTOFF') or g('CUTOFF_NEW'),
              'dia_salida_new': g('DIA_SALIDA_NEW'),
-             'bloque': g('BLOQUE'), 'nomenclatura': g('NOMENCLATURA'),
-             'tipo_salida': g('TIPO_SALIDA'), 'id_cluster': g('ID_CLUSTER'),
+             'bloque': g('BLOQUE'),
+             'nomenclatura': g('NOMENCLATURA'),
+             'tipo_salida': g('TIPO_SALIDA'),
+             'id_cluster': g('ID_CLUSTER'),
              'mantener_original': g('MANTENER_ORIGINAL','').strip().upper() == 'SI'}
         if r['playa'] and r['tipo_salida']:
             records.append(r)
@@ -549,39 +553,115 @@ def assign_especial(orig_dia, orig_playa, new_dia, raw_bloque, id_cluster,
 
 def load_especial_bloque_map(parrilla_path):
     """
-    Read the 'SEMANA SANTA W*' sheet from the parrilla workbook.
-    Returns {(dia_new, playa): bloque} for all especiales with a valid BLOQUE.
-    This is the authoritative source for which bloque to assign to each especial.
+    Read especial bloque assignments from the parrilla workbook.
+    Supports two formats:
+    - S14: reads 'SEMANA SANTA W*' sheet (has BLOQUE column directly)
+    - S18: reads parrilla_test_* sheet (derives bloque from ID_CLUSTER_NEW + Resumen Bloques)
+    Returns {(dia_new_upper, playa): bloque}
     """
     from openpyxl import load_workbook as _lw
     import re as _re
     result = {}
+    _DAY_PFX = _re.compile(
+        r'^(DOMINGO|LUNES|MARTES|MIERCOLES|JUEVES|VIERNES|SABADO)_', _re.IGNORECASE)
     try:
         wb = _lw(str(parrilla_path), read_only=True)
-        # Find the SEMANA SANTA sheet
-        sheet = next((s for s in wb.sheetnames 
-                      if 'SEMANA SANTA' in s.upper() or 'SEMANA_SANTA' in s.upper()), None)
-        if not sheet:
-            return result
-        ws = wb[sheet]
-        rows = list(ws.iter_rows(values_only=True))
-        col = {str(h): i for i, h in enumerate(rows[0]) if h}
-        for r in rows[1:]:
-            bloque = r[col.get('BLOQUE', -1)] if 'BLOQUE' in col else None
-            if not bloque or str(bloque) in ('None', '#N/A', 'NO_BLOQUE'): continue
-            dia_new = str(r[col.get('DIA_SALIDA_NEW', 3)] or '')
-            playa_field = str(r[col.get('DIA_PLAYA_NEW', 5)] or '')
-            tipo = str(r[col.get('TIPO_SALIDA', 22)] or '')
-            if 'CANCELADA' in tipo: continue
-            # Extract playa from "LUNES_ESPANA_GUARROMAN" → "ESPANA_GUARROMAN"
-            m = _re.match(r'^(?:DOMINGO|LUNES|MARTES|MIERCOLES|JUEVES|VIERNES|SABADO)_(.+)', playa_field)
-            if m and dia_new:
-                result[(dia_new.upper(), m.group(1))] = str(bloque)
+
+        # --- Try S14 format: SEMANA SANTA sheet with BLOQUE column ---
+        ss_sheet = next((s for s in wb.sheetnames
+                         if 'SEMANA SANTA' in s.upper() or 'SEMANA_SANTA' in s.upper()), None)
+        if ss_sheet:
+            ws = wb[ss_sheet]
+            rows = list(ws.iter_rows(values_only=True))
+            col = {str(h).strip().upper(): i for i, h in enumerate(rows[0]) if h}
+            for r in rows[1:]:
+                bloque = r[col.get('BLOQUE', -1)] if 'BLOQUE' in col else None
+                if not bloque or str(bloque) in ('None', '#N/A', 'NO_BLOQUE'): continue
+                dia_new = str(r[col.get('DIA_SALIDA_NEW', 3)] or '')
+                playa_field = str(r[col.get('DIA_PLAYA_NEW', 1)] or '')
+                tipo = str(r[col.get('TIPO_SALIDA', 12)] or '')
+                if 'CANCELADA' in tipo: continue
+                m = _DAY_PFX.match(playa_field)
+                if m and dia_new:
+                    result[(dia_new.upper(), playa_field[m.end():].strip())] = str(bloque)
+            if result:
+                return result
+
+        # --- S18 format: derive bloque from ID_CLUSTER_NEW + Resumen Bloques ---
+        # Build cluster→bloque map
+        _cb = {}
+        if 'Resumen Bloques' in wb.sheetnames:
+            for _r in wb['Resumen Bloques'].iter_rows(values_only=True):
+                if _r[0] and _r[1] and str(_r[0]).strip() not in ('Bloque', ''):
+                    _cb[str(_r[1]).strip().upper()] = str(_r[0]).strip()
+
+        def _c2b(cluster_str):
+            for part in str(cluster_str or '').strip().upper().split('-'):
+                if part in _cb: return _cb[part]
+            return ''
+
+        # Find parrilla sheet (has TIPO_SALIDA + DIA_PLAYA_NEW)
+        par_sheet = next((s for s in wb.sheetnames
+                          if s.lower().startswith('parrilla_test')), None)
+        if not par_sheet:
+            par_sheet = next((s for s in wb.sheetnames
+                              if any(str(h or '').strip().upper() == 'TIPO_SALIDA'
+                                     for h in next(wb[s].iter_rows(values_only=True, max_row=1), []))), None)
+        if par_sheet:
+            ws2 = wb[par_sheet]
+            rows2 = list(ws2.iter_rows(values_only=True))
+            col2 = {str(h).strip().upper(): i for i, h in enumerate(rows2[0]) if h}
+            for r in rows2[1:]:
+                tipo = str(r[col2.get('TIPO_SALIDA', 10)] or '').strip().upper()
+                if 'ESPECIAL DIA CAMBIO' not in tipo: continue
+                if 'CANCELADA' in tipo: continue
+                dia_new = str(r[col2.get('DIA_SALIDA_NEW', 4)] or '').strip().upper()
+                dpn = str(r[col2.get('DIA_PLAYA_NEW', 1)] or '').strip()
+                cluster_new = str(r[col2.get('ID_CLUSTER_NEW', 9)] or '').strip()
+                bloque = _c2b(cluster_new)
+                m = _DAY_PFX.match(dpn)
+                playa = dpn[m.end():].strip() if m else str(r[col2.get('AGRUPACION_PLAYA', 3)] or '').strip()
+                if playa and dia_new and bloque:
+                    result[(dia_new, playa)] = bloque
     except Exception as e:
         print(f"Warning: could not load especial bloque map: {e}")
     return result
 
-def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, filter_days=None, superplaya_map=None, especial_bloque_map=None):
+
+def load_cancelled_especiales(parrilla_path):
+    """
+    Read the 'SEMANA SANTA W*' sheet and return a set of playa names
+    that are tipo=CANCELADA — these are especiales that got cancelled.
+    """
+    from openpyxl import load_workbook as _lwb_c
+    import re as _re_c
+    cancelled = set()
+    try:
+        wb = _lwb_c(parrilla_path, read_only=True)
+        sheet = next((s for s in wb.sheetnames
+                      if re.search(r'SEMANA.SANTA', s, re.IGNORECASE)
+                      or re.search(r'W\d+', s)), None)
+        if not sheet:
+            return cancelled
+        rows = list(wb[sheet].iter_rows(values_only=True))
+        hdr = {str(h).strip().upper(): i for i, h in enumerate(rows[0]) if h}
+        for r in rows[1:]:
+            if str(r[hdr.get('TIPO_SALIDA', 99)] or '').strip().upper() != 'CANCELADA':
+                continue
+            dpn = str(r[hdr.get('DIA_PLAYA_NEW', 1)] or '').strip()
+            # "CANCELADA_ESPANA_BALEARES_TSA" → "ESPANA_BALEARES_TSA"
+            if dpn.upper().startswith('CANCELADA_'):
+                cancelled.add(dpn[10:].strip().upper())
+            else:
+                m = _re_c.match(r'(?:\w+)_(.+)', dpn)
+                if m:
+                    cancelled.add(m.group(1).strip().upper())
+    except Exception:
+        pass
+    return cancelled
+
+
+def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, filter_days=None, superplaya_map=None, especial_bloque_map=None, cancelled_especiales=None):
     canceladas, especiales, habituales = {}, {}, {}
 
     for r in parrilla_records:
@@ -709,6 +789,22 @@ def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, fi
                     rampa = f"R{int(m.group(1)):02d}{m.group(2)}"
                     pos   = int(m.group(3))
                     run_occ.setdefault(dia_new, {}).setdefault(rampa, {})[pos] = info.get('grupo_new','ESP')
+        # Rename description if playa is cancelled in SEMANA SANTA
+        if cancelled_especiales and playa.upper() in cancelled_especiales and new_rows:
+            semana = especial_bloque_map and next(
+                (k[1] for k in (especial_bloque_map or {}) if k[0]==dia_new and k[1]==playa), None)
+            suffix = '_CANCELADA_SOLO_W14'
+            import re as _re_canc
+            renamed = []
+            for _r in new_rows:
+                _desc = str(_r[2] or '')
+                if playa in _desc and suffix not in _desc:
+                    # Replace playa name with playa+suffix wherever it appears
+                    # Handle both "(ESPECIAL" and "_ESPECIAL" suffixes
+                    if f'{playa} ' in _desc or f'{playa}(' in _desc or f'{playa}_' in _desc:
+                        _desc = _desc.replace(playa, playa + suffix, 1)
+                renamed.append((_r[0], _r[1], _desc, _r[3], _r[4], _r[5], _r[6]))
+            new_rows = renamed
         output_rows.extend(new_rows)
         especial_rows.extend(new_rows)
         added += len(new_rows)
@@ -1129,9 +1225,11 @@ def main():
     if superplaya_map:
         print(f"  Superplayas cargadas: {len(set(superplaya_map.values()))} grupos")
     especial_bloque_map = load_especial_bloque_map(parrilla_path)
+    cancelled_especiales = load_cancelled_especiales(parrilla_path)
+    print(f"  Canceladas en SEMANA SANTA: {len(cancelled_especiales)} playas")
     if especial_bloque_map:
         print(f"  Bloque map (SEMANA SANTA): {len(especial_bloque_map)} entradas")
-    output_rows, summary = process(parrilla, tagged, by_dia_playa, capacity, bloque_timings, filter_days, superplaya_map, especial_bloque_map)
+    output_rows, summary = process(parrilla, tagged, by_dia_playa, capacity, bloque_timings, filter_days, superplaya_map, especial_bloque_map, cancelled_especiales)
 
     ok      = [r for r in summary['assignment_results'] if r['status'] == 'OK']
     partial = [r for r in summary['assignment_results'] if r['status'] == 'PARTIAL']
@@ -1172,6 +1270,29 @@ def main():
         print("\n⚠ Parciales:")
         for r in partial:
             print(f"  {r['playa']:42s} {r['n_assigned']}/{r['n_destinos']} posiciones")
+
+    # Post-process: rename any row whose playa is in cancelled_especiales
+    # This catches cases like GUARROMAN_TSA with non-standard desc format
+    if cancelled_especiales:
+        import re as _re_post
+        def _rename_if_cancelled(rows):
+            out = []
+            for _r in rows:
+                _desc = str(_r[2] or '')
+                _renamed = _desc
+                for _cp in cancelled_especiales:
+                    if _cp in _desc.upper() and '_CANCELADA_SOLO_W14' not in _desc:
+                        # Find exact case match
+                        _m = _re_post.search(_re_post.escape(_cp), _desc, _re_post.IGNORECASE)
+                        if _m:
+                            _match_str = _m.group(0)
+                            _renamed = _desc.replace(_match_str, _match_str + '_CANCELADA_SOLO_W14', 1)
+                            break
+                out.append((_r[0], _r[1], _renamed, _r[3], _r[4], _r[5], _r[6]))
+            return out
+        output_rows = _rename_if_cancelled(output_rows)
+        if summary.get('especial_rows'):
+            summary['especial_rows'] = _rename_if_cancelled(summary['especial_rows'])
 
     print(f"\nEscribiendo GD  → {gd_out}")
     write_gd(output_rows, gd_header, gd_out)
