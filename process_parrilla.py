@@ -767,7 +767,7 @@ def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, fi
         _raw_bloques = [b.strip() for b in str(_raw_bloque).split(',') if b.strip()]
         if not _raw_bloques:
             _raw_bloques = ['']
-        new_rows, info = [], {'status': 'NO_CONFIG', 'rampas': {}}
+        new_rows, info = [], {'status': 'NO_CONFIG', 'rampas': {}, 'playa': playa, 'dia_orig': dia_orig, 'dia_new': dia_new, 'n_assigned': 0, 'n_destinos': 0, 'msg': 'sin datos en ningún día'}
         for _single_bloque in _raw_bloques:
             _rows_b, _info_b = assign_especial(
                 dia_orig, playa, dia_new,
