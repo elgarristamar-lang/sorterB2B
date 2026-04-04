@@ -1,4 +1,4 @@
-# Version: 0.01
+# Version: 0.02
 # sorter_map_excel_por_dia.py
 # ---------------------------------------------------------
 # Genera un Excel "Sorter Map" en formato slots:
@@ -10,6 +10,12 @@
 # - Slots multi-bloque -> texto "J1+J2", color gris
 # - Columna extra MULTI_BLOQUE por subrampa con detalle de posiciones multi + comentario
 # - Incluye LEYENDA y tabla BLOQUES_DESTINOS (1 fila por destino)
+#
+# CAMBIOS v0.02:
+# - Nueva estructura parrilla: todo en una sola hoja (no hay hoja 'SEMANA SANTA' separada)
+# - Canceladas y especiales se detectan por TIPO_SALIDA en la hoja seleccionada
+# - Nuevo tipo reconocido: 'ESPECIAL CUTOFF' (mismo día, distinto bloque/cutoff)
+# - Índices de columnas dinámicos (no posición fija) en validación
 # ---------------------------------------------------------
 
 from __future__ import annotations
@@ -298,12 +304,231 @@ def blocks_overlap(a: Tuple[int,int], b: Tuple[int,int]) -> bool:
     return a[0] < b[1] and b[0] < a[1]
 
 # -----------------------------
+# Carga especiales desde parrilla (v0.02)
+# -----------------------------
+def load_especiales_from_parrilla(parrilla_path: str, parrilla_sheet: str) -> List[dict]:
+    """
+    Lee la hoja de parrilla y devuelve especiales con los campos:
+      sheet_day   — pestaña del sort map donde se pinta (letra del BLOQUE, NO DIA_SALIDA_NEW)
+                    '1BLOD4' → D → DOMINGO  |  '2BLOL5' → L → LUNES  |  '4BLOX3' → X → MIERCOLES
+      bloque_token— token corto (ej 'D4', 'L5', 'X3') que coincide con los bloques de esa pestaña
+    """
+    import re as _re_p
+    _TIPOS = {'ESPECIAL DIA CAMBIO', 'ESPECIAL CUTOFF'}
+    _DAY_PFX = _re_p.compile(
+        r'^(DOMINGO|LUNES|MARTES|MIERCOLES|JUEVES|VIERNES|SABADO)_(.+)$', _re_p.IGNORECASE)
+    _BLO_RE  = _re_p.compile(r'\d+BLO([A-Z])(\d+)', _re_p.IGNORECASE)
+    _LETTER_TO_DAY = {'D':'DOMINGO','L':'LUNES','M':'MARTES','X':'MIERCOLES',
+                      'J':'JUEVES','V':'VIERNES','S':'SABADO'}
+    result = []
+    try:
+        from openpyxl import load_workbook as _lwb_p
+        wb = _lwb_p(str(parrilla_path), read_only=True)
+        sheet = parrilla_sheet if parrilla_sheet in wb.sheetnames else wb.sheetnames[0]
+        rows = list(wb[sheet].iter_rows(values_only=True))
+        hdr = {str(h).strip().upper(): i for i, h in enumerate(rows[0]) if h}
+        _i_tipo   = hdr.get('TIPO_SALIDA')
+        _i_dpo    = hdr.get('DIA_PLAYA_ORIGINAL')
+        _i_dianew = hdr.get('DIA_SALIDA_NEW')
+        _i_bloque = hdr.get('BLOQUE')
+        _i_clnew  = hdr.get('ID_CLUSTER_NEW')
+        if None in (_i_tipo, _i_dpo, _i_dianew):
+            return result
+        _DAY_TO_LETTER = {v: k for k, v in _LETTER_TO_DAY.items()}
+        for r in rows[1:]:
+            tipo      = str(r[_i_tipo] or '').strip().upper()
+            if tipo not in _TIPOS: continue
+            dpo       = str(r[_i_dpo]    or '').strip()
+            dia_new   = str(r[_i_dianew] or '').strip().upper()
+            blq_raw   = str(r[_i_bloque] or '').strip() if _i_bloque is not None else ''
+            clnew     = str(r[_i_clnew]  or '').strip() if _i_clnew  is not None else ''
+            m_dpo = _DAY_PFX.match(dpo)
+            if not m_dpo or not dia_new: continue
+            # Derivar token y pestaña desde la letra del BLOQUE
+            m_blo = _BLO_RE.search(blq_raw)
+            if m_blo:
+                letter       = m_blo.group(1).upper()
+                bloque_token = f"{letter}{m_blo.group(2)}"
+                sheet_day    = _LETTER_TO_DAY.get(letter, dia_new)
+            else:
+                # Sin BLOQUE explícito: buscar en ID_CLUSTER_NEW el token del DIA_SALIDA_NEW
+                tgt = _DAY_TO_LETTER.get(dia_new, '')
+                found = ''
+                for p in clnew.split('-'):
+                    p = p.strip()
+                    if p and p[0].upper() == tgt:
+                        found = p.upper(); break
+                if not found and clnew:
+                    found = clnew.split('-')[0].strip().upper()
+                bloque_token = found or '_ESP_'
+                letter       = bloque_token[0] if bloque_token and bloque_token != '_ESP_' else ''
+                sheet_day    = _LETTER_TO_DAY.get(letter, dia_new)
+            result.append({
+                'dia_orig':     m_dpo.group(1).upper(),
+                'playa_orig':   m_dpo.group(2).strip(),
+                'dia_new':      dia_new,
+                'bloque_token': bloque_token,
+                'sheet_day':    sheet_day,
+                'tipo':         tipo,
+            })
+    except Exception as _e:
+        print(f"\u26a0\ufe0f No se pudieron cargar especiales de parrilla: {_e}")
+    return result
+
+
+def build_especiales_slot_map(
+    grupo_df: pd.DataFrame,
+    especiales: List[dict],
+    day_name: str,
+    block_intervals: Optional[Dict[str, Tuple[int,int]]],
+    cap_map: Optional[Dict[str, int]] = None,
+) -> Tuple[Dict[str, Dict[str, Set[int]]], Dict[str, Dict[str, Dict[int, Set[str]]]]]:
+    """
+    Para la pestaña `day_name`, busca en el GD los slots del día ORIGEN
+    de las especiales cuyo sheet_day == day_name y los pinta en amarillo.
+
+    Si un slot ya está ocupado por un bloque regular en esa pestaña (conflicto
+    de solapamiento temporal), se busca un slot LIBRE en la misma subrampa o
+    en otra subrampa disponible — nunca se pinta en rojo.
+
+    bloque_token coincide exactamente con los tokens de bloques de esa pestaña.
+    """
+    import re as _re_e
+    desc_col = find_col(grupo_df, ["Descripción Grupos de destino", "Descripcion Grupos de destino", "DESCRIPCION GRUPOS DE DESTINO"])
+    elem_col = find_col(grupo_df, ["Elemento", "ELEMENTO"])
+    tipo_col = find_col(grupo_df, ["Tipo de zona", "TIPO DE ZONA", "TIPO_ZONA", "TIPO ZONA"])
+    if not desc_col or not elem_col or not tipo_col:
+        return {}, {}
+
+    esp_usage:  Dict[str, Dict[str, Set[int]]] = defaultdict(lambda: defaultdict(set))
+    esp_playas: Dict[str, Dict[str, Dict[int, Set]]] = defaultdict(lambda: defaultdict(lambda: defaultdict(set)))
+
+    # Solo las especiales cuyo sheet_day coincide con esta pestaña
+    target = [e for e in especiales if e['sheet_day'] == day_name.upper()]
+    if not target:
+        return {}, {}
+
+    # ── Construir mapa de slots OCUPADOS en esta pestaña (todos los bloques del día) ──
+    # Un slot está ocupado si ya tiene cualquier bloque regular asignado
+    occupied_in_day: Dict[str, Set[int]] = defaultdict(set)
+    _re_desc_occ = _re_e.compile(
+        r'(DOMINGO|LUNES|MARTES|MIERCOLES|JUEVES|VIERNES|SABADO)_(.+?)(?:\s*\(|\s*$)',
+        _re_e.IGNORECASE)
+    # Detectar letra del día actual para filtrar bloques de este día
+    _DAY_TO_LETTER = {'DOMINGO':'D','LUNES':'L','MARTES':'M','MIERCOLES':'X',
+                      'JUEVES':'J','VIERNES':'V','SABADO':'S'}
+    _day_letter = _DAY_TO_LETTER.get(day_name.upper(), '')
+    _blo_day_re = _re_e.compile(rf'\d+BLO{_day_letter}\d+', _re_e.IGNORECASE) if _day_letter else None
+
+    for _, row in grupo_df.iterrows():
+        if str(row[tipo_col]).strip().upper() != 'POSTEX': continue
+        desc = str(row[desc_col])
+        if 'CANCELAD' in desc.upper(): continue
+        # Solo bloques de este día (ej solo D* para DOMINGO)
+        if _blo_day_re and not _blo_day_re.search(desc): continue
+        sub, slot = parse_subramp_and_slot_from_elemento(row[elem_col])
+        if sub is None or slot is None: continue
+        if any(sub.startswith(p) for p in EXCLUDE_PREFIXES): continue
+        occupied_in_day[sub].add(slot)
+
+    # ── Slots libres en todo el día (para reasignación de conflictos) ──
+    # Ordenados: primero por subrampas con más huecos (para agrupar bien)
+    def _free_slots_in_day(exclude_subs_slots: Dict[str, Set[int]]) -> List[tuple]:
+        """Devuelve lista de (sub, slot) libres, ordenados por sub → slot."""
+        free: List[tuple] = []
+        all_subs = sorted(
+            (cap_map or {}).keys() if cap_map else occupied_in_day.keys(),
+            key=ramp_sort_key
+        )
+        for sub in all_subs:
+            if any(sub.startswith(p) for p in EXCLUDE_PREFIXES): continue
+            cap = (cap_map or {}).get(sub, 0)
+            if cap == 0: continue
+            used = occupied_in_day.get(sub, set()) | exclude_subs_slots.get(sub, set())
+            for p in range(1, cap + 1):
+                if p not in used:
+                    free.append((sub, p))
+        return free
+
+    # ── Indexar GD: (dia_orig, playa) → filas POSTEX ──
+    gd_by_dia_playa: Dict[tuple, list] = defaultdict(list)
+    for _, row in grupo_df.iterrows():
+        if str(row[tipo_col]).strip().upper() != 'POSTEX': continue
+        desc = str(row[desc_col])
+        if 'CANCELAD' in desc.upper(): continue
+        m = _re_desc_occ.search(desc)
+        if not m: continue
+        gd_by_dia_playa[(m.group(1).upper(), m.group(2).strip())].append(row)
+
+    # Slots ya asignados a especiales en esta ejecución (evitar dobles)
+    esp_assigned_slots: Dict[str, Set[int]] = defaultdict(set)
+
+    for esp in target:
+        dia_orig  = esp['dia_orig']
+        playa     = esp['playa_orig']
+        token_new = esp['bloque_token']
+
+        gd_rows = gd_by_dia_playa.get((dia_orig, playa), [])
+        if not gd_rows:
+            base = _re_e.sub(r'_(TSA|EXT|CPT|AIR|CIP|OL)$', '', playa, flags=_re_e.IGNORECASE)
+            gd_rows = gd_by_dia_playa.get((dia_orig, base), [])
+
+        # Slots preferidos del día origen
+        preferred: List[tuple] = []
+        for row in gd_rows:
+            sub, slot = parse_subramp_and_slot_from_elemento(row[elem_col])
+            if sub is None or slot is None: continue
+            if any(sub.startswith(p) for p in EXCLUDE_PREFIXES): continue
+            preferred.append((sub, slot))
+
+        n_needed = len(preferred)
+        if n_needed == 0:
+            continue
+
+        # Calcular todos los slots ocupados (regulares + ya asignados a otras especiales)
+        all_occupied: Dict[str, Set[int]] = defaultdict(set)
+        for s, slots_set in occupied_in_day.items():
+            all_occupied[s].update(slots_set)
+        for s, slots_set in esp_assigned_slots.items():
+            all_occupied[s].update(slots_set)
+
+        # Intentar usar slots preferidos; si están ocupados, tomar slots libres
+        assigned: List[tuple] = []
+        for (sub, slot) in preferred:
+            if slot not in all_occupied.get(sub, set()):
+                assigned.append((sub, slot))
+                all_occupied[sub].add(slot)
+                esp_assigned_slots[sub].add(slot)
+
+        # Si faltan slots, rellenar con los libres del día
+        n_missing = n_needed - len(assigned)
+        if n_missing > 0:
+            free_pool = _free_slots_in_day(esp_assigned_slots)
+            for (sub, slot) in free_pool:
+                if n_missing <= 0: break
+                if slot not in all_occupied.get(sub, set()):
+                    assigned.append((sub, slot))
+                    all_occupied[sub].add(slot)
+                    esp_assigned_slots[sub].add(slot)
+                    n_missing -= 1
+
+        # Registrar en esp_usage y esp_playas
+        for (sub, slot) in assigned:
+            esp_usage[token_new][sub].add(slot)
+            esp_playas[token_new][sub][slot].add((dia_orig, playa))
+
+    return dict(esp_usage), dict(esp_playas)
+
+# -----------------------------
 # Cálculo uso POSTEX por día (agregando bloques)
 # -----------------------------
 def compute_day_usage(
     grupo_df: pd.DataFrame,
     day_blocks: List[str],
     block_intervals: Optional[Dict[str, Tuple[int,int]]] = None,
+    especiales_ext: Optional[List[dict]] = None,
+    day_name: str = '',
+    _cap_map_ext: Optional[Dict[str, int]] = None,
 ) -> Tuple[Dict[str, Dict[str, Set[int]]], int]:
     warnings = 0
     especial_usage: Dict[str, Dict[str, Set[int]]] = defaultdict(lambda: defaultdict(set))
@@ -373,9 +598,25 @@ def compute_day_usage(
                 _dia_desc = _playa_m.group(1).strip().upper()
                 _playa_name = _playa_m.group(2).strip()
                 playa_map[block_token][sub][slot].add((_dia_desc, _playa_name))
-            # Track if this entry is an especial
+            # Track if this entry is an especial (GD ya tiene (ESPECIAL) en desc — S14)
             if '(ESPECIAL' in _desc_str.upper() or _desc_str.upper().endswith(' ESPECIAL'):
                 especial_usage[block_token][sub].add(slot)
+
+    # v0.02: Inyectar especiales desde parrilla (nueva estructura, todo en Hoja1)
+    # Busca slots en GD del día origen y los pinta en amarillo en el día destino
+    # Si hay conflicto con regulares, usa slots libres del mismo día
+    if especiales_ext and day_name:
+        _esp_u, _esp_p = build_especiales_slot_map(
+            grupo_df, especiales_ext, day_name, block_intervals,
+            cap_map=_cap_map_ext)
+        for _bt, _sub_map in _esp_u.items():
+            for _sub, _slots in _sub_map.items():
+                especial_usage[_bt][_sub].update(_slots)
+                usage[_bt][_sub].update(_slots)  # también añadir al usage para que se pinte
+        for _bt, _sub_map in _esp_p.items():
+            for _sub, _slot_map in _sub_map.items():
+                for _sl, _playas in _slot_map.items():
+                    playa_map[_bt][_sub][_sl].update(_playas)
 
     return usage, warnings, especial_usage, playa_map
 
@@ -790,8 +1031,19 @@ def write_day_sheet(
                         for sub, slots in sorted(by_sub.items(), key=lambda x: ramp_sort_key(x[0]))
                     )
                     # Check if this playa is cancelled in the semana especial sheet
-                    _is_cancelled = (cancelled_esp is not None
-                                     and playa.upper() in cancelled_esp)
+                    # cancelled_esp ahora es un set de (dia, playa) para evitar falsos positivos
+                    _is_cancelled = False
+                    if cancelled_esp:
+                        # Intentar con el día de origen de la playa especial
+                        for _entry in slots_list:
+                            _dia_check = _entry[2] if len(_entry) > 2 and _entry[2] else day_name
+                            if (_dia_check.upper(), playa.upper()) in cancelled_esp:
+                                _is_cancelled = True
+                                break
+                            # Fallback: compatibilidad con set de strings planos
+                            if playa.upper() in cancelled_esp:
+                                _is_cancelled = True
+                                break
                     vals = [dia_display, playa, bt,
                             "⚠ CANCELADA — REVISAR" if _is_cancelled else pos_str]
                     alns = [_center, _left, _center, _wrap]
@@ -1051,9 +1303,15 @@ def write_validation_sheet(ws, grupo_df, cap_map, block_intervals,
     rows_orig = list(wb_orig.active.iter_rows(values_only=True))[1:]
 
     wb_par = _lwb(parrilla_path, read_only=True)
-    # Find parrilla sheet
-    par_sheet = next((s for s in wb_par.sheetnames if 'parrilla' in s.lower() or 'test' in s.lower()), wb_par.sheetnames[0])
-    par_rows  = list(wb_par[par_sheet].iter_rows(values_only=True))[1:]
+    # FIX v0.02: usar hoja pasada como parrilla_sheet si existe; si no, primera hoja
+    # (nueva estructura: todo en una hoja, no hay hoja 'SEMANA SANTA' separada)
+    if parrilla_sheet and parrilla_sheet in wb_par.sheetnames:
+        par_sheet = parrilla_sheet
+    else:
+        par_sheet = wb_par.sheetnames[0]
+    par_rows_raw = list(wb_par[par_sheet].iter_rows(values_only=True))
+    par_hdr = {str(h).strip().upper(): i for i, h in enumerate(par_rows_raw[0]) if h}
+    par_rows = par_rows_raw[1:]
 
     rows_gd = grupo_df.values.tolist()  # our output GD (already loaded)
     # Map column indices from grupo_df
@@ -1061,11 +1319,20 @@ def write_validation_sheet(ws, grupo_df, cap_map, block_intervals,
     tipo_col = find_col(grupo_df, ["Tipo de zona","TIPO DE ZONA"])
     elem_col = find_col(grupo_df, ["Elemento","ELEMENTO"])
 
-    # Pre-build parrilla sets
-    canceladas_par  = {(str(r[3]), str(r[2])): r for r in par_rows
-                       if r[10] and "CANCELADA" in str(r[10]) and r[2] and r[3]}
-    especiales_par  = {(str(r[3]), str(r[2])): str(r[5]) for r in par_rows
-                       if r[10] and "ESPECIAL DIA CAMBIO" in str(r[10]) and r[2] and r[3] and r[5]}
+    # FIX v0.02: índices dinámicos desde cabecera real (no posición fija)
+    _i_tipo  = par_hdr.get('TIPO_SALIDA', 12)
+    _i_dpo   = par_hdr.get('DIA_PLAYA_ORIGINAL', 2)
+    _i_dpn   = par_hdr.get('DIA_PLAYA_NEW', 1)
+    _i_dsnew = par_hdr.get('DIA_SALIDA_NEW', 3)
+    _i_coff  = par_hdr.get('CUTOFF_NEW', 4)
+
+    # Pre-build parrilla sets — detectar tanto DIA CAMBIO como CUTOFF
+    _ESPECIAL_TIPOS_VAL = {'ESPECIAL DIA CAMBIO', 'ESPECIAL CUTOFF'}
+    canceladas_par  = {(str(r[_i_dsnew]), str(r[_i_dpo])): r for r in par_rows
+                       if r[_i_tipo] and "CANCELADA" in str(r[_i_tipo]) and r[_i_dpo] and r[_i_dsnew]}
+    especiales_par  = {(str(r[_i_dsnew]), str(r[_i_dpo])): str(r[_i_dsnew]) for r in par_rows
+                       if r[_i_tipo] and str(r[_i_tipo]).strip().upper() in _ESPECIAL_TIPOS_VAL
+                       and r[_i_dpo] and r[_i_dsnew]}
 
     # Pre-build orig GD slot counts per token
     orig_slots = _dd(set)
@@ -1387,63 +1654,82 @@ def main():
     block_intervals = build_block_intervals(bloques)
 
     # ── Load E2/manual routes + cancelled especiales from parrilla ────────────
+    # FIX v0.02: Nueva estructura parrilla — todo en una sola hoja (Hoja1 o la
+    # seleccionada). Se filtra por TIPO_SALIDA en lugar de buscar hoja 'SEMANA SANTA'.
+    # Tipos reconocidos como especial: 'ESPECIAL DIA CAMBIO' y 'ESPECIAL CUTOFF'
     _e2_by_day: dict = defaultdict(list)
-    _cancelled_esp: set = set()   # playa names cancelled in semana especial sheet
+    _cancelled_esp: set = set()   # playa names cancelled in parrilla
     _par_path = _sys.argv[6] if len(_sys.argv) > 6 else None
+    _par_sheet_arg = _sys.argv[7] if len(_sys.argv) > 7 else None
     if _par_path:
         try:
+            import re as _re_ss
             from openpyxl import load_workbook as _lwb_e2
             _wb_e2 = _lwb_e2(_par_path, read_only=True)
-            # Read cancelled entries from SEMANA SANTA sheet
-            import re as _re_ss
-            for _sh_name in _wb_e2.sheetnames:
-                if 'SEMANA' in _sh_name.upper() or 'SANTA' in _sh_name.upper() or 'W1' in _sh_name:
-                    _ss_rows = list(_wb_e2[_sh_name].iter_rows(values_only=True))
-                    _ss_hdr = {str(h).strip().upper(): i for i, h in enumerate(_ss_rows[0]) if h}
-                    _canceladas_por_dia: dict = defaultdict(list)
-                    for _r_ss in _ss_rows[1:]:
-                        _ss_tipo = str(_r_ss[_ss_hdr.get('TIPO_SALIDA', 99)] or '').strip().upper()
-                        if _ss_tipo != 'CANCELADA': continue
-                        _ss_dpn = str(_r_ss[_ss_hdr.get('DIA_PLAYA_NEW', 1)] or '').strip()
-                        _ss_dpo = str(_r_ss[_ss_hdr.get('DIA_PLAYA_ORIGINAL', 2)] or '').strip()
-                        # Playa name: strip CANCELADA_ prefix from DIA_PLAYA_NEW
-                        if _ss_dpn.upper().startswith('CANCELADA_'):
-                            _playa_c = _ss_dpn[10:].strip()
-                        else:
-                            _m_c = _re_ss.match(r'(?:DOMINGO|LUNES|MARTES|MIERCOLES|JUEVES|VIERNES|SABADO)_(.+)', _ss_dpn, _re_ss.IGNORECASE)
-                            _playa_c = _m_c.group(1).strip() if _m_c else ''
-                        # Original day from DIA_PLAYA_ORIGINAL
-                        _m_co = _re_ss.match(r'(DOMINGO|LUNES|MARTES|MIERCOLES|JUEVES|VIERNES|SABADO)_', _ss_dpo, _re_ss.IGNORECASE)
-                        _dia_c = _m_co.group(1).upper() if _m_co else ''
-                        if _playa_c:
-                            _cancelled_esp.add(_playa_c.upper())
-                            if _dia_c:
-                                _canceladas_por_dia[_dia_c].append(_playa_c)
-                    break
-            _sh_e2 = next((s for s in _wb_e2.sheetnames
-                           if 'parrilla' in s.lower() or 'test' in s.lower()),
-                          _wb_e2.sheetnames[0])
-            _rows_e2 = list(_wb_e2[_sh_e2].iter_rows(values_only=True))
-            _hdr_e2 = {str(h).strip().upper(): i for i, h in enumerate(_rows_e2[0]) if h}
-            _KNOWN_E2 = {"BOSNIA_CPT","CHIPRE_NORTE","INDONESIA","CHIPRE",
-                         "BOSNIA_CPT_2","CHIPRE_NORTE_2","INDONESIA_CPT"}
-            for _r_e2 in _rows_e2[1:]:
-                _tipo_e2  = str(_r_e2[_hdr_e2.get('TIPO_SALIDA', 99)] or '').upper()
-                _playa_e2 = str(_r_e2[_hdr_e2.get('PLAYA', 99)] or '').strip()
-                _dia_e2   = str(_r_e2[_hdr_e2.get('DIA_SALIDA_NEW', 99)] or '').strip().upper()
-                _blq_e2   = str(_r_e2[_hdr_e2.get('BLOQUE', 99)] or '').strip()
-                if 'CANCELADA' in _tipo_e2: continue
-                if 'ESPECIAL DIA CAMBIO' not in _tipo_e2: continue
-                if (_playa_e2.upper() in _KNOWN_E2
-                        or 'E2' in _tipo_e2 or 'MANUAL' in _tipo_e2 or 'EXDOCK' in _tipo_e2):
-                    if _dia_e2:
-                        _e2_by_day[_dia_e2].append((_playa_e2, _blq_e2))
+
+            # Seleccionar hoja: usar la misma que se pasó como argv[7] si existe,
+            # si no, la primera hoja disponible (nueva estructura todo-en-uno)
+            if _par_sheet_arg and _par_sheet_arg in _wb_e2.sheetnames:
+                _sh_main = _par_sheet_arg
+            else:
+                _sh_main = _wb_e2.sheetnames[0]
+
+            _all_rows = list(_wb_e2[_sh_main].iter_rows(values_only=True))
+            _hdr_main = {str(h).strip().upper(): i for i, h in enumerate(_all_rows[0]) if h}
+
+            _canceladas_por_dia: dict = defaultdict(list)
+            _KNOWN_E2 = {"BOSNIA_CPT", "CHIPRE_NORTE", "INDONESIA", "CHIPRE",
+                         "BOSNIA_CPT_2", "CHIPRE_NORTE_2", "INDONESIA_CPT"}
+            _ESPECIAL_TIPOS = {'ESPECIAL DIA CAMBIO', 'ESPECIAL CUTOFF'}
+
+            for _r in _all_rows[1:]:
+                _tipo = str(_r[_hdr_main.get('TIPO_SALIDA', 99)] or '').strip().upper()
+                _dpo  = str(_r[_hdr_main.get('DIA_PLAYA_ORIGINAL', 2)] or '').strip()
+                _dpn  = str(_r[_hdr_main.get('DIA_PLAYA_NEW', 1)] or '').strip()
+                _dia_new = str(_r[_hdr_main.get('DIA_SALIDA_NEW', 3)] or '').strip().upper()
+                _blq  = str(_r[_hdr_main.get('BLOQUE', 99)] or '').strip()
+                _manip = str(_r[_hdr_main.get('MANIPULADO', 99)] or '').strip().upper()
+
+                # CANCELADAS: extraer nombre de playa y día original
+                if _tipo == 'CANCELADA':
+                    # DIA_PLAYA_ORIGINAL tiene formato "LUNES_ESPANA_LAS_PALMAS"
+                    _m_co = _re_ss.match(r'(DOMINGO|LUNES|MARTES|MIERCOLES|JUEVES|VIERNES|SABADO)_(.+)',
+                                         _dpo, _re_ss.IGNORECASE)
+                    if _m_co:
+                        _dia_c = _m_co.group(1).upper()
+                        _playa_c = _m_co.group(2).strip()
+                        # Clave (dia, playa) para evitar falsos REVISAR:
+                        # una playa puede ser CANCELADA el martes pero ESPECIAL CUTOFF el lunes
+                        _cancelled_esp.add((_dia_c, _playa_c.upper()))
+                        _canceladas_por_dia[_dia_c].append(_playa_c)
+                    continue
+
+                # ESPECIALES (DIA CAMBIO + CUTOFF): detectar E2/manual
+                if _tipo not in _ESPECIAL_TIPOS:
+                    continue
+                # Extraer nombre playa de DIA_PLAYA_ORIGINAL
+                _m_ep = _re_ss.match(r'(?:DOMINGO|LUNES|MARTES|MIERCOLES|JUEVES|VIERNES|SABADO)_(.+)',
+                                     _dpo, _re_ss.IGNORECASE)
+                _playa_e2 = _m_ep.group(1).strip() if _m_ep else ''
+                # E2: MANIPULADO='NO' y playa conocida, o marcado explícitamente
+                if _playa_e2.upper() in _KNOWN_E2 or _manip == 'NO' and _playa_e2.upper() in _KNOWN_E2:
+                    if _dia_new:
+                        _e2_by_day[_dia_new].append((_playa_e2, _blq))
+
         except Exception:
-            _canceladas_por_dia = defaultdict(list)  # parrilla unavailable
+            _canceladas_por_dia = defaultdict(list)
     if '_canceladas_por_dia' not in dir():
         _canceladas_por_dia: dict = defaultdict(list)
 
     all_playa_data = []
+
+    # v0.02: cargar especiales desde parrilla para pintarlas en amarillo en el mapa
+    _especiales_parrilla: List[dict] = []
+    if _par_path:
+        _esp_sheet = _par_sheet_arg or (_wb_e2.sheetnames[0] if '_wb_e2' in dir() else None)
+        _especiales_parrilla = load_especiales_from_parrilla(_par_path, _esp_sheet or 'Hoja1')
+        print(f"  Especiales desde parrilla cargadas: {len(_especiales_parrilla)}")
+
     for day_name, day_code in DAY_SHEETS:
         # Detect max block index from block_intervals for this day_code
         max_idx = 9  # generous upper bound; no harm if no entries exist for high indices
@@ -1452,7 +1738,12 @@ def main():
                       or any(f"BLO{day_code}{i}" in k for k in (block_intervals or {}))]
         if not day_blocks:  # fallback
             day_blocks = [f"{day_code}{i}" for i in range(7)]
-        usage_by_block, warnings, especial_by_block, playa_by_block = compute_day_usage(grupo, day_blocks, block_intervals)
+        usage_by_block, warnings, especial_by_block, playa_by_block = compute_day_usage(
+            grupo, day_blocks, block_intervals,
+            especiales_ext=_especiales_parrilla,
+            day_name=day_name,
+            _cap_map_ext=cap_map,
+        )
         total_warnings += warnings
 
         block_colors = build_block_color_map_for_day(day_code)
