@@ -1,9 +1,124 @@
-# Version: 0.06
+# Version: 0.07
 import streamlit as st
 import subprocess, sys, tempfile, datetime as dt
 from pathlib import Path
 
 BASE_DIR = Path(__file__).parent
+
+# ── Validation panel ──────────────────────────────────────────────────────────
+def _run_validation(parrilla_bytes, gd_bytes=None):
+    """Run validate_parrilla.validate() safely; return issues list."""
+    try:
+        sys.path.insert(0, str(BASE_DIR))
+        from validate_parrilla import validate
+        return validate(parrilla_bytes, gd_bytes)
+    except Exception as e:
+        return [{"severity": "warning", "category": "estructura",
+                 "title": "No se pudo ejecutar la validación previa",
+                 "detail": str(e), "items": [], "autocorrected": False}]
+
+def render_validation(parrilla_file, gd_file=None):
+    """
+    Run validation and render the results panel in Streamlit.
+    Always returns True (never blocks generation).
+    """
+    par_bytes = parrilla_file.read(); parrilla_file.seek(0)
+    gd_bytes  = None
+    if gd_file:
+        gd_bytes = gd_file.read(); gd_file.seek(0)
+
+    issues = _run_validation(par_bytes, gd_bytes)
+
+    # Count severities
+    counts = {"error": 0, "warning": 0, "info": 0, "ok": 0}
+    for iss in issues:
+        counts[iss["severity"]] = counts.get(iss["severity"], 0) + 1
+
+    # Header badge
+    if counts["error"] > 0:
+        badge = f"🔴 {counts['error']} error(s)"
+        if counts["warning"]: badge += f"  ·  ⚠ {counts['warning']} aviso(s)"
+    elif counts["warning"] > 0:
+        badge = f"⚠ {counts['warning']} aviso(s)"
+    else:
+        badge = "✅ Todo OK"
+
+    with st.expander(f"🔍 Validación previa — {badge}", expanded=(counts["error"] > 0 or counts["warning"] > 0)):
+        # Group by category
+        for cat_key, cat_label in [("estructura", "Estructura del fichero"),
+                                    ("contenido",  "Contenido leído"),
+                                    ("cobertura",  "Cobertura especiales en GD")]:
+            cat_issues = [i for i in issues if i["category"] == cat_key]
+            if not cat_issues:
+                continue
+            st.markdown(f"**{cat_label}**")
+            for iss in cat_issues:
+                sev = iss["severity"]
+                icon = {"error": "🔴", "warning": "⚠️", "info": "ℹ️", "ok": "✅"}.get(sev, "·")
+                title = iss["title"]
+                if iss.get("autocorrected"):
+                    title += "  *(autocorrección aplicada)*"
+
+                if sev == "error":
+                    st.error(f"{icon} **{title}**\n\n{iss['detail']}")
+                elif sev == "warning":
+                    st.warning(f"{icon} **{title}**\n\n{iss['detail']}")
+                elif sev == "info":
+                    st.info(f"{icon} **{title}**\n\n{iss['detail']}")
+                else:
+                    st.success(f"{icon} {title}")
+
+                if iss.get("items"):
+                    items_md = "  \n".join(f"- `{it}`" for it in iss["items"])
+                    st.markdown(items_md)
+
+            st.markdown("")  # spacing between categories
+
+    return True  # never blocks
+
+def _render_output_validation(parrilla_file, gd_output_bytes: bytes):
+    """
+    Post-generation validation: cross-check the produced GD against the parrilla.
+    Shows results in an expander. Never blocks.
+    """
+    try:
+        sys.path.insert(0, str(BASE_DIR))
+        from validate_parrilla import validate_output, summary
+        par_bytes = parrilla_file.read(); parrilla_file.seek(0)
+        issues = validate_output(par_bytes, gd_output_bytes)
+    except Exception as e:
+        st.warning(f"⚠️ No se pudo ejecutar la validación del resultado: {e}")
+        return
+
+    counts = {"error": 0, "warning": 0, "info": 0, "ok": 0}
+    for iss in issues:
+        counts[iss["severity"]] = counts.get(iss["severity"], 0) + 1
+
+    if counts["error"] > 0:
+        badge = f"🔴 {counts['error']} error(s)"
+        if counts["warning"]: badge += f"  ·  ⚠ {counts['warning']} aviso(s)"
+        expanded = True
+    elif counts["warning"] > 0:
+        badge = f"⚠ {counts['warning']} aviso(s)"
+        expanded = True
+    else:
+        badge = "✅ Sort map OK"
+        expanded = False
+
+    with st.expander(f"✅ Validación del resultado — {badge}", expanded=expanded):
+        for iss in issues:
+            sev  = iss["severity"]
+            icon = {"error": "🔴", "warning": "⚠️", "info": "ℹ️", "ok": "✅"}.get(sev, "·")
+            if sev == "error":
+                st.error(f"{icon} **{iss['title']}**\n\n{iss['detail']}")
+            elif sev == "warning":
+                st.warning(f"{icon} **{iss['title']}**\n\n{iss['detail']}")
+            elif sev == "info":
+                st.info(f"{icon} **{iss['title']}**\n\n{iss['detail']}")
+            else:
+                st.success(f"{icon} {iss['title']}")
+            if iss.get("items"):
+                st.markdown("\n".join(f"- `{it}`" for it in iss["items"]))
 
 def gd_to_dxc_csv(xlsx_bytes):
     # Convert GD xlsx to DXC upload CSV format (POSTEX + SOREXP separately)
@@ -185,6 +300,8 @@ st.divider()
 if st.session_state.get("_run1"):
     st.session_state["_run1"] = False
     sc = semana.strip() or sheet.strip().upper()
+    # Validation (always runs, never blocks)
+    render_validation(f_parrilla, f_gd)
     with tempfile.TemporaryDirectory() as _tmp:
         tmp = Path(_tmp)
         p   = save_uploads(tmp)
@@ -209,11 +326,14 @@ if st.session_state.get("_run1"):
             st.session_state["r1_can"]   = (can_path.name, can_path.read_text(encoding='utf-8')) if can_path.exists() else None
             st.session_state["r1_html"]  = (html.name,  html.read_bytes()) if html.exists() else None
             st.session_state["r1_day_filter"] = None  # full run, no day filter
+            # ── Post-generation sort map validation ──
+            _render_output_validation(f_parrilla, _gd_bytes)
 
 # ── Execute action 2 ──────────────────────────────────────────────────────────
 if st.session_state.get("_run2"):
     st.session_state["_run2"] = False
     sc = semana.strip() or sheet.strip().upper()
+    render_validation(f_parrilla, f_gd)
     with tempfile.TemporaryDirectory() as _tmp:
         tmp = Path(_tmp)
         p   = save_uploads(tmp)
@@ -239,6 +359,7 @@ if st.session_state.get("_run2"):
 if st.session_state.get("_run3"):
     st.session_state["_run3"] = False
     sc = semana.strip() or sheet.strip().upper()
+    render_validation(f_parrilla, f_gd)
     with tempfile.TemporaryDirectory() as _tmp:
         tmp = Path(_tmp)
         p   = save_uploads(tmp)
@@ -376,4 +497,4 @@ if st.session_state["r3_map"] is not None:
     st.caption("Hojas: DOM · LUN · MAR · MIÉ · JUE · VIE · SÁB · LEYENDA")
 
 st.divider()
-st.caption("v0.06 · VDL B2B · Estrictamente confidencial")
+st.caption("v0.07 · VDL B2B · Estrictamente confidencial")
