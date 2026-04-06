@@ -403,22 +403,28 @@ def find_free_slots(occ, capacity, n_needed,
     assigned, rem = [], n_needed
 
     # Paso 1: rampas hermanas (mismo grupo, ya usadas por sibling anterior)
+    # Only use preferred rampas if together they have enough slots for n_needed.
+    # If not, skip them so the playa lands on a single rampa with enough space.
     filtered_pref = [r for r in (preferred_rampas or [])
                      if committed_group is None or _ramp_group(r) == committed_group]
-    for r in sorted(filtered_pref, key=_ramp_number):
-        if rem <= 0: break
-        free = get_free(r)
-        if free:
-            assigned.extend((r, p) for p in free[:rem]); rem -= len(free[:rem])
+    pref_total_free = sum(len(get_free(r)) for r in filtered_pref)
+    if pref_total_free >= n_needed:
+        for r in sorted(filtered_pref, key=_ramp_number):
+            if rem <= 0: break
+            free = get_free(r)
+            if free:
+                assigned.extend((r, p) for p in free[:rem]); rem -= len(free[:rem])
 
-    # Paso 2: par-pareja de las hermanas
-    pair_pool = {pair_of(r) for r in filtered_pref if pair_of(r) and pair_of(r) not in filtered_pref
-                 and (committed_group is None or _ramp_group(pair_of(r)) == committed_group)}
-    for r in sorted(pair_pool, key=_ramp_number):
-        if rem <= 0: break
-        free = get_free(r)
-        if free:
-            assigned.extend((r, p) for p in free[:rem]); rem -= len(free[:rem])
+    # Paso 2: par-pareja de las hermanas (only if paso 1 was used)
+    pair_pool = set()
+    if pref_total_free >= n_needed:
+        pair_pool = {pair_of(r) for r in filtered_pref if pair_of(r) and pair_of(r) not in filtered_pref
+                     and (committed_group is None or _ramp_group(pair_of(r)) == committed_group)}
+        for r in sorted(pair_pool, key=_ramp_number):
+            if rem <= 0: break
+            free = get_free(r)
+            if free:
+                assigned.extend((r, p) for p in free[:rem]); rem -= len(free[:rem])
 
     if rem <= 0:
         return assigned, rem
@@ -429,18 +435,18 @@ def find_free_slots(occ, capacity, n_needed,
 
     def sort_key(r):
         free = get_free(r)
-        if not free: return (999,) * 5
-        # is_empty = no standard entries on this rampa (ANY block, not just conflicting)
+        if not free: return (999,) * 6
+        # Prefer rampas that have enough slots for the whole playa (avoid splitting)
+        has_enough = len(free) >= rem
         _any_occ = full_occ if full_occ is not None else occ
         is_empty   = len(_any_occ.get(r, {})) == 0
         in_group   = committed_group is None or _ramp_group(r) == committed_group
         prox       = _ramp_proximity_key(r, _anchor) if _anchor else _ramp_number(r)
         mate       = pair_of(r)
         mate_free  = len(get_free(mate)) if mate and mate not in EXCLUDED_RAMPAS else 0
-        # Vacía+anchor→proximidad real; vacía sin anchor→número bajo; no vacía→peor
-        # Empty+anchor → closest to anchor; Empty+no anchor → biggest free first; Non-empty → last
         eff_prox = prox if (is_empty and _anchor) else (-len(free) if is_empty else 1000 + prox)
-        return (-int(in_group), eff_prox, -int(mate_free > 0), -(len(free) + mate_free))
+        # has_enough=True sorts first (0 < 1)
+        return (-int(in_group), -int(has_enough), eff_prox, -int(mate_free > 0), -(len(free) + mate_free))
 
     pool = sorted([r for r in capacity if r not in EXCLUDED_RAMPAS and r not in tried
                    and get_free(r)], key=sort_key)
