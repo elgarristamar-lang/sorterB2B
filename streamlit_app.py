@@ -420,8 +420,21 @@ if st.session_state["r1_gd"] is not None:
                 if r.returncode == 0 and gd.exists():
                     esp_path = Path(str(gd).replace('.xlsx','_SOLO_ESPECIALES.xlsx'))
                     can_path = Path(str(gd).replace('.xlsx','_CANCELADAS.txt'))
-                    st.session_state["r1_gd"]   = (gd.name,   gd.read_bytes())
-                    st.session_state["r1_esp"]  = (esp_path.name, esp_path.read_bytes()) if esp_path.exists() else None
+                    _gd_bytes_f = gd.read_bytes()
+                    # Add day suffix to filenames so downloads are distinct from full run
+                    _day_suffix = "_" + "+".join(selected_days)
+                    _gd_name_f   = gd.stem + _day_suffix + ".xlsx"
+                    _esp_name_f  = esp_path.stem + _day_suffix + ".xlsx" if esp_path.exists() else None
+                    st.session_state["r1_gd"]   = (_gd_name_f, _gd_bytes_f)
+                    st.session_state["r1_esp"]  = (_esp_name_f, esp_path.read_bytes()) if esp_path.exists() else None
+                    # Regenerate DXC CSVs from filtered GD
+                    _px_f, _sx_f = gd_to_dxc_csv(_gd_bytes_f)
+                    st.session_state["r1_postex_csv"] = (gd.stem + _day_suffix + "_POSTEX.csv", _px_f)
+                    st.session_state["r1_sorexp_csv"] = (gd.stem + _day_suffix + "_SOREXP.csv", _sx_f)
+                    if esp_path.exists():
+                        _epx_f, _esx_f = gd_to_dxc_csv(esp_path.read_bytes())
+                        st.session_state["r1_esp_postex_csv"] = (esp_path.stem + _day_suffix + "_POSTEX.csv", _epx_f)
+                        st.session_state["r1_esp_sorexp_csv"] = (esp_path.stem + _day_suffix + "_SOREXP.csv", _esx_f)
                     st.session_state["r1_can"]  = (can_path.name, can_path.read_text(encoding='utf-8')) if can_path.exists() else None
                     st.session_state["r1_html"] = (html.name,  html.read_bytes()) if html.exists() else None
                     st.session_state["r1_day_filter"] = selected_days
