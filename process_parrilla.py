@@ -44,6 +44,12 @@ DAY_MIN = {'DOMINGO':0,'LUNES':1440,'MARTES':2880,'MIERCOLES':4320,
 CLUSTER_DAY = {'D':'DOMINGO','L':'LUNES','M':'MARTES','X':'MIERCOLES',
                'J':'JUEVES','V':'VIERNES','S':'SABADO'}
 
+def bloque_letra(bloque_str):
+    """Extract letter from bloque code: '2BLOL1' → 'L', '4BLOX3' → 'X'"""
+    import re as _re
+    m = _re.match(r'^\d+BLO([A-Z])\d+$', str(bloque_str or ''))
+    return m.group(1) if m else None
+
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 
@@ -794,8 +800,11 @@ def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, fi
             rem_moved += 1; continue
         elif key in especiales and key in mantener_set:
             pass  # MANTENER_ORIGINAL=SI → keep original AND add new-day entries
-        # Day filter: skip entries not in selected days (when filter active)
-        if filter_days and entry['dia'] not in filter_days: continue
+        # Bloque filter: skip entries whose bloque letter is not selected
+        if filter_days:
+            _letra = bloque_letra(entry.get('bloque',''))
+            if _letra and _letra not in filter_days: continue
+            elif not _letra and entry['dia'] not in [CLUSTER_DAY.get(l,l) for l in filter_days]: continue
         output_rows.append(entry['_raw']); kept += 1
 
     # Accumulate slots assigned in this run per new_dia so subsequent
@@ -817,8 +826,11 @@ def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, fi
     especiales_sorted = sorted(especiales.items(), key=_esp_sort_key)
 
     for (dia_orig, playa), (dia_new, record) in especiales_sorted:
-        # Day filter: skip especiales whose new day is not selected
-        if filter_days and dia_new not in filter_days: continue
+        # Bloque filter: skip especiales whose bloque letter is not selected
+        if filter_days:
+            _blq = record.get('bloque','')
+            _letra_esp = bloque_letra(_blq)
+            if not _letra_esp or _letra_esp not in filter_days: continue
         # Preferred rampas: rampas already used by the last sibling (same prefix, same new day)
         prefix = (superplaya_map or {}).get(playa.upper(), lexical_prefix(playa))
         pref_rampas = _last_rampas_by_prefix.get((dia_new, prefix))
@@ -874,6 +886,8 @@ def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, fi
             new_rows.extend(_rows_b)
             if _info_b.get('status') == 'OK':
                 info = _info_b  # keep last OK info for tracking
+            elif _info_b.get('status') in ('E2_ROUTE', 'NO_CONFIG') and info.get('status') == 'NO_CONFIG':
+                info = _info_b  # propagate E2_ROUTE/NO_CONFIG if nothing better yet
         # Update sibling proximity tracking
         if info.get('status') == 'OK' and info.get('rampas'):
             used_rampas = set(info['rampas'].keys())
@@ -1277,7 +1291,7 @@ def write_canceladas_txt(canceladas, filter_days, out_path):
     DAY_ORDER = ['DOMINGO','LUNES','MARTES','MIERCOLES','JUEVES','VIERNES','SABADO']
     by_day = defaultdict(list)
     for (dia, playa) in canceladas:
-        if filter_days and dia not in filter_days:
+        if filter_days and CLUSTER_DAY.get(list(filter_days)[0] if filter_days else '',dia) and dia not in [CLUSTER_DAY.get(l,l) for l in filter_days]:
             continue
         by_day[dia].append(playa)
     lines = ['CANCELADAS — SALIDAS A ELIMINAR DEL SORTER', '=' * 44, '']
