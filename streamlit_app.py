@@ -109,14 +109,23 @@ def _render_output_validation(parrilla_file, gd_output_bytes: bytes):
         for iss in issues:
             sev  = iss["severity"]
             icon = {"error": "🔴", "warning": "⚠️", "info": "ℹ️", "ok": "✅"}.get(sev, "·")
+            _is_tabla = "Resumen por dia" in iss["title"]
             if sev == "error":
                 st.error(f"{icon} **{iss['title']}**\n\n{iss['detail']}")
             elif sev == "warning":
-                st.warning(f"{icon} **{iss['title']}**\n\n{iss['detail']}")
+                if _is_tabla:
+                    st.warning(f"{icon} **{iss['title']}**")
+                    st.code(iss['detail'], language=None)
+                else:
+                    st.warning(f"{icon} **{iss['title']}**\n\n{iss['detail']}")
             elif sev == "info":
                 st.info(f"{icon} **{iss['title']}**\n\n{iss['detail']}")
             else:
-                st.success(f"{icon} {iss['title']}")
+                if _is_tabla:
+                    st.success(f"{icon} **{iss['title']}**")
+                    st.code(iss['detail'], language=None)
+                else:
+                    st.success(f"{icon} {iss['title']}")
             if iss.get("items"):
                 st.markdown("\n".join(f"- `{it}`" for it in iss["items"]))
 
