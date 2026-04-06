@@ -264,42 +264,47 @@ def show_log(r, expanded=False):
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
-# ── Three action buttons ──────────────────────────────────────────────────────
+# ── Action buttons — new flow: Sort Map first, then GD ───────────────────────
 st.markdown("### Acciones")
 
-base_ok = bool(f_parrilla and f_gd and f_cap)
-vis_ok  = bool(base_ok and f_bloques)
+base_ok   = bool(f_parrilla and f_gd and f_cap)
+vis_ok    = bool(base_ok and f_bloques)
+sortmap_done = bool(st.session_state.get("r3_map"))  # GD only available after sort map
+gd_ok     = bool(sortmap_done and base_ok)             # GD requires sort map first
 
 b1, b2, b3 = st.columns(3)
 with b1:
-    st.markdown("**1 · Configuración DXC**")
-    st.caption("GRUPO_DESTINOS + resumen HTML")
-    if st.button("⚙️ Generar", key="go1", type="primary",
-                 disabled=not base_ok, use_container_width=True):
-        # Clear previous results so we re-run
-        for k in ["r1_gd","r1_esp","r1_can","r1_html","r1_day_filter"]:
-            st.session_state[k] = None
-        st.session_state["_run1"] = True
-    if not base_ok:
-        st.caption("_Sube parrilla, GD y capacidad_")
+    st.markdown("**1 · Sorter Map por día**")
+    st.caption("Asigna especiales · valida visualmente")
+    if st.button("🗺 Generar", key="go3", type="primary",
+                 disabled=not vis_ok, use_container_width=True):
+        st.session_state["r3_map"] = None
+        st.session_state["r3_gd_bytes"] = None  # clear cached GD for sort map
+        st.session_state["_run3"] = True
+    if not vis_ok:
+        st.caption("_Sube parrilla, GD, capacidad y bloques_")
 
 with b2:
-    st.markdown("**2 · Gantt 1H**")
+    st.markdown("**2 · Configuración DXC**")
+    st.caption("Descarga el nuevo GD con los cambios")
+    if st.button("⚙️ Generar", key="go1", type="primary",
+                 disabled=not gd_ok, use_container_width=True):
+        for k in ["r1_gd","r1_esp","r1_can","r1_html","r1_day_filter","r1_gd_filtered_bytes","r3_gd_bytes"]:
+            st.session_state[k] = None
+        st.session_state["_run1"] = True
+    if not gd_ok:
+        if not base_ok:
+            st.caption("_Sube parrilla, GD y capacidad_")
+        elif not sortmap_done:
+            st.caption("_Genera el Sort Map primero_")
+
+with b3:
+    st.markdown("**3 · Gantt 1H**")
     st.caption("Visual bloques × rampas × hora")
     if st.button("📊 Generar", key="go2", type="primary",
                  disabled=not vis_ok, use_container_width=True):
         st.session_state["r2_gantt"] = None
         st.session_state["_run2"] = True
-    if not vis_ok:
-        st.caption("_Requiere también bloques horarios_")
-
-with b3:
-    st.markdown("**3 · Sorter Map por día**")
-    st.caption("1 pestaña por día, slots físicos")
-    if st.button("🗺 Generar", key="go3", type="primary",
-                 disabled=not vis_ok, use_container_width=True):
-        st.session_state["r3_map"] = None
-        st.session_state["_run3"] = True
     if not vis_ok:
         st.caption("_Requiere también bloques horarios_")
 
@@ -314,8 +319,21 @@ if st.session_state.get("_run1"):
     with tempfile.TemporaryDirectory() as _tmp:
         tmp = Path(_tmp)
         p   = save_uploads(tmp)
-        with st.spinner("Procesando parrilla y asignando rampas…"):
-            gd, html, r = run_gd(p, tmp, sc)
+        # Reuse GD from sort map step if available — avoids regenerating
+        _r3_gd = st.session_state.get("r3_gd_bytes")
+        if _r3_gd:
+            gd = tmp / f"GRUPO_DESTINOS_{sc}.xlsx"
+            gd.write_bytes(_r3_gd)
+            html = tmp / f"resumen_sorter_{sc}.html"
+            with st.spinner("Generando resumen HTML…"):
+                r = subprocess.run(
+                    [sys.executable, str(BASE_DIR / "process_parrilla.py"),
+                     str(p["parrilla"]), str(p["gd"]), str(p["cap"]),
+                     sheet.strip(), sc, str(gd), str(html), ""],
+                    capture_output=True, text=True, timeout=180)
+        else:
+            with st.spinner("Procesando parrilla y asignando rampas…"):
+                gd, html, r = run_gd(p, tmp, sc)
         show_log(r)
         if r.returncode != 0 or not gd.exists():
             st.error("El proceso terminó con error.")
@@ -372,19 +390,30 @@ if st.session_state.get("_run3"):
     with tempfile.TemporaryDirectory() as _tmp:
         tmp = Path(_tmp)
         p   = save_uploads(tmp)
-        with st.spinner("Generando GD base…"):
-            gd, _, r0 = run_gd(p, tmp, sc)
-        if r0.returncode != 0 or not gd.exists():
-            st.error("Error generando GD base.")
-            show_log(r0, expanded=True)
+        # Use filtered GD if available, else generate full GD
+        _filtered_bytes = st.session_state.get("r1_gd_filtered_bytes")
+        _filter_days    = st.session_state.get("r1_day_filter")
+        if _filtered_bytes:
+            gd = tmp / f"GD_{sc}_filtered.xlsx"
+            gd.write_bytes(_filtered_bytes)
+            r0_ok = True
+            st.info(f"Usando GD filtrado: {', '.join(_filter_days or [])}")
         else:
+            with st.spinner("Generando GD base…"):
+                gd, _, r0 = run_gd(p, tmp, sc)
+            r0_ok = r0.returncode == 0 and gd.exists()
+            if not r0_ok:
+                st.error("Error generando GD base.")
+                show_log(r0, expanded=True)
+        if r0_ok:
+            # Save GD bytes so action 1 can reuse without regenerating
+            st.session_state["r3_gd_bytes"] = gd.read_bytes()
             out = tmp / f"sorter_map_{sc}.xlsx"
             with st.spinner("Generando Sorter Map…"):
                 _sorter_cmd = [
                     sys.executable, str(BASE_DIR / "sorter_map_por_dia.py"),
                     str(p["cap"]), str(gd), str(p["bloques"]), str(out), "Hoja1",
                 ]
-                # Optional validation: pass parrilla + orig GD paths
                 if "parrilla" in p and "gd" in p:
                     _sorter_cmd += [str(p["parrilla"]), sheet.strip(), str(p["gd"])]
                 r = subprocess.run(_sorter_cmd, capture_output=True, text=True, timeout=180)
