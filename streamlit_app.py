@@ -224,6 +224,15 @@ st.divider()
 # ── Helpers ───────────────────────────────────────────────────────────────────
 ALL_DAYS = ["DOMINGO","LUNES","MARTES","MIERCOLES","JUEVES","VIERNES","SABADO"]
 
+# Block letter → day name mapping (for filter display)
+BLOQUE_LETRA_DAY = {
+    "D": "DOMINGO",  "L": "LUNES",  "M": "MARTES",
+    "X": "MIERCOLES", "J": "JUEVES", "V": "VIERNES", "S": "SABADO"
+}
+# Ordered block families for the multiselect
+BLOQUE_OPTIONS = ["D (Domingo)","L (Lunes)","M (Martes)",
+                  "X (Miercoles)","J (Jueves)","V (Viernes)","S (Sabado)"]
+
 def save_uploads(tmp: Path):
     p = {}
     for key, f, name in [
@@ -430,16 +439,19 @@ if st.session_state["r1_gd"] is not None:
     st.success(f"✓ Configuración {sc} generada")
 
     # ── Day filter for filtered re-extraction ──
-    with st.expander("🔍 Filtrar por día y regenerar especiales"):
-        selected_days = st.multiselect(
-            "Días a incluir en el GD filtrado",
-            options=ALL_DAYS,
+    with st.expander("🔍 Filtrar por bloque y regenerar especiales"):
+        selected_bloques = st.multiselect(
+            "Bloques a incluir en el GD filtrado",
+            options=BLOQUE_OPTIONS,
             default=[],
             key="day_filter_sel",
-            placeholder="Selecciona días…",
+            placeholder="Selecciona bloques…",
+            help="Cada letra = familia de bloques activos ese día (D=Dom, L=Lun, M=Mar, X=Mie, J=Jue, V=Vie, S=Sab)",
         )
+        # Convert block letters to day names for process_parrilla filter
+        selected_days = [BLOQUE_LETRA_DAY[b.split()[0]] for b in selected_bloques]
         if st.button("⚙️ Regenerar con filtro", key="regen_filter",
-                     disabled=not (selected_days and f_parrilla and f_gd and f_cap)):
+                     disabled=not (selected_bloques and f_parrilla and f_gd and f_cap)):
             days_arg = ",".join(selected_days)
             with tempfile.TemporaryDirectory() as _tmp:
                 tmp = Path(_tmp)
@@ -451,7 +463,7 @@ if st.session_state["r1_gd"] is not None:
                     can_path = Path(str(gd).replace('.xlsx','_CANCELADAS.txt'))
                     _gd_bytes_f = gd.read_bytes()
                     # Add day suffix to filenames so downloads are distinct from full run
-                    _day_suffix = "_" + "+".join(selected_days)
+                    _day_suffix = "_" + "+".join(b.split()[0] for b in selected_bloques)
                     _gd_name_f   = gd.stem + _day_suffix + ".xlsx"
                     _esp_name_f  = esp_path.stem + _day_suffix + ".xlsx" if esp_path.exists() else None
                     st.session_state["r1_gd"]   = (_gd_name_f, _gd_bytes_f)
@@ -474,7 +486,10 @@ if st.session_state["r1_gd"] is not None:
 
     # Day filter badge
     if st.session_state["r1_day_filter"]:
-        st.info(f"Filtrado a: {', '.join(st.session_state['r1_day_filter'])}")
+        # Show block letters instead of day names
+        _day_to_letter = {v: k for k, v in BLOQUE_LETRA_DAY.items()}
+        _labels = [f"{_day_to_letter.get(d, d)} ({d})" for d in st.session_state['r1_day_filter']]
+        st.info(f"Filtrado a: {', '.join(_labels)}")
 
     # Downloads row 1: GD completo + solo especiales
     c1, c2 = st.columns(2)
