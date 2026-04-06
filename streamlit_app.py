@@ -1,4 +1,4 @@
-# Version: 0.07
+# Version: 0.08
 import streamlit as st
 import subprocess, sys, tempfile, datetime as dt
 from pathlib import Path
@@ -448,8 +448,8 @@ if st.session_state["r1_gd"] is not None:
             placeholder="Selecciona bloques…",
             help="Cada letra = familia de bloques activos ese día (D=Dom, L=Lun, M=Mar, X=Mie, J=Jue, V=Vie, S=Sab)",
         )
-        # Convert block letters to day names for process_parrilla filter
-        selected_days = [BLOQUE_LETRA_DAY[b.split()[0]] for b in selected_bloques]
+        # Pass block letters directly to process_parrilla (it now filters by bloque letter)
+        selected_days = [b.split()[0] for b in selected_bloques]  # just the letters: M, X, L...
         if st.button("⚙️ Regenerar con filtro", key="regen_filter",
                      disabled=not (selected_bloques and f_parrilla and f_gd and f_cap)):
             days_arg = ",".join(selected_days)
@@ -487,8 +487,7 @@ if st.session_state["r1_gd"] is not None:
     # Day filter badge
     if st.session_state["r1_day_filter"]:
         # Show block letters instead of day names
-        _day_to_letter = {v: k for k, v in BLOQUE_LETRA_DAY.items()}
-        _labels = [f"{_day_to_letter.get(d, d)} ({d})" for d in st.session_state['r1_day_filter']]
+        _labels = [f"Bloque {l}" for l in st.session_state['r1_day_filter']]
         st.info(f"Filtrado a: {', '.join(_labels)}")
 
     # Downloads row 1: GD completo + solo especiales
