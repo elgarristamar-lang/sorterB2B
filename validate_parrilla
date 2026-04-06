@@ -183,18 +183,7 @@ def _load_parrilla(xlsx_bytes: bytes) -> Dict:
                 "en la asignación de rampas.",
             ))
 
-    # Check SEMANA SANTA sheet (informative — S15 format doesn't need it)
-    has_ss_sheet = any(
-        "SEMANA" in s.upper() or "SANTA" in s.upper() for s in sheets
-    )
-    if not has_ss_sheet and target_sheet:
-        col_issues.append(_issue(
-            "info", "estructura",
-            "No hay hoja 'SEMANA SANTA' — formato unificado detectado",
-            f"Los datos de canceladas y especiales se leerán de la hoja '{target_sheet}'. "
-            "Formato S15/unificado reconocido.",
-            autocorrected=True,
-        ))
+    # S15 unified format (no SEMANA SANTA sheet needed) — no issue to report
 
     # Parse records
     tipo_idx = col.get("TIPO_SALIDA")
@@ -304,8 +293,10 @@ def _load_parrilla(xlsx_bytes: bytes) -> Dict:
 
 def _load_gd_playas(xlsx_bytes: bytes) -> Dict:
     """
-    Returns {(dia, playa): [elementos]} for all POSTEX sorter entries in GD.
-    Also returns set of all playa names found.
+    Returns:
+      by_dia_playa: {(dia, playa): [elementos]} for POSTEX sorter entries
+      all_playas: set of playa names with sorter elements
+      e2_playas: set of playa names that are E2/manual (MAN/EXDOCK elements only)
     """
     from openpyxl import load_workbook
     wb = load_workbook(io.BytesIO(xlsx_bytes), read_only=True)
@@ -316,19 +307,19 @@ def _load_gd_playas(xlsx_bytes: bytes) -> Dict:
     is_dxc = "Estado" in hdr or "Secuencia" in hdr
 
     if is_dxc:
-        idx_desc  = hdrs.get("DESCRIPCIÓN GRUPOS DE DESTINO", hdrs.get("DESCRIPCION GRUPOS DE DESTINO"))
-        idx_zona  = hdrs.get("TIPO DE ZONA")
-        idx_elem  = hdrs.get("ELEMENTO")
+        idx_desc = hdrs.get("DESCRIPCIÓN GRUPOS DE DESTINO", hdrs.get("DESCRIPCION GRUPOS DE DESTINO"))
+        idx_zona = hdrs.get("TIPO DE ZONA")
+        idx_elem = hdrs.get("ELEMENTO")
     else:
         idx_desc, idx_zona, idx_elem = 2, 3, 6
 
     by_dia_playa = defaultdict(list)
     all_playas   = set()
+    playa_has_sorter: dict = {}   # playa → True if has sorter elem, False if only E2
 
     for row in all_rows[1:]:
         def g(i):
-            if i is None or i >= len(row) or row[i] is None:
-                return ""
+            if i is None or i >= len(row) or row[i] is None: return ""
             s = str(row[i]).strip()
             return "" if s.startswith("=") else s
 
@@ -336,17 +327,26 @@ def _load_gd_playas(xlsx_bytes: bytes) -> Dict:
         zona = g(idx_zona).upper()
         elem = g(idx_elem)
 
-        if zona != "POSTEX" or not _SORTER_RE.match(elem):
-            continue
+        if zona != "POSTEX": continue
 
         bloque, dia, playa = _parse_gd_desc(desc)
-        if not (bloque and dia and playa):
-            continue
+        if not (dia and playa): continue
 
-        all_playas.add(playa.upper())
-        by_dia_playa[(dia.upper(), playa.upper())].append(elem)
+        pu = playa.upper()
+        if pu not in playa_has_sorter:
+            playa_has_sorter[pu] = False
 
-    return {"by_dia_playa": dict(by_dia_playa), "all_playas": all_playas}
+        if _SORTER_RE.match(elem) and not _E2_RE.match(elem):
+            playa_has_sorter[pu] = True
+            all_playas.add(pu)
+            by_dia_playa[(dia.upper(), pu)].append(elem)
+        elif _E2_RE.match(elem):
+            pass  # E2 element — tracked in playa_has_sorter as False
+
+    e2_playas = {p for p, has_sorter in playa_has_sorter.items() if not has_sorter}
+
+    return {"by_dia_playa": dict(by_dia_playa), "all_playas": all_playas,
+            "e2_playas": e2_playas}
 
 
 # ── Main validation ───────────────────────────────────────────────────────────
@@ -433,6 +433,7 @@ def validate(parrilla_bytes: bytes, gd_bytes: Optional[bytes] = None) -> List[Di
     gd = _load_gd_playas(gd_bytes)
     by_dia_playa = gd["by_dia_playa"]
     gd_playas    = gd["all_playas"]
+    gd_e2_playas = gd.get("e2_playas", set())
 
     # Para cada especial, verificar que existe config en el GD del DÍA ORIGINAL.
     # El GD del día nuevo NO existe todavía — la aplicación lo crea.
@@ -450,7 +451,10 @@ def validate(parrilla_bytes: bytes, gd_bytes: Optional[bytes] = None) -> List[Di
             continue
         seen.add(playa)
 
-        if playa not in gd_playas:
+        if playa in gd_e2_playas:
+            # Has config in GD but as E2 route — not a sorter position
+            sin_config_orig.append({**r, "found_on_days": ["E2/MANUAL"]})
+        elif playa not in gd_playas:
             sin_config_ninguno.append(r)
         elif dia_orig and (dia_orig, playa) not in by_dia_playa:
             other_days = sorted({d for (d, p) in by_dia_playa if p == playa})
@@ -466,18 +470,29 @@ def validate(parrilla_bytes: bytes, gd_bytes: Optional[bytes] = None) -> List[Di
         ))
 
     if sin_config_orig:
-        items_detail = [
-            f"{r['playa']}  (día original: {r['dia_orig'] or '?'} → encontrada en: {', '.join(r['found_on_days'][:3])})"
-            for r in sin_config_orig[:10]
-        ]
-        issues.append(_issue(
-            "warning", "cobertura",
-            f"{len(sin_config_orig)} especiales sin config en el día original — se usará fallback",
-            "Existen en el GD pero no en el día de origen de la parrilla. "
-            "El script buscará el día con más posiciones y lo usará como fuente — "
-            "revisa que el día original en la parrilla es correcto.",
-            items=items_detail,
-        ))
+        e2_in_orig = [r for r in sin_config_orig if r.get("found_on_days") == ["E2/MANUAL"]]
+        fallback_orig = [r for r in sin_config_orig if r.get("found_on_days") != ["E2/MANUAL"]]
+
+        if e2_in_orig:
+            issues.append(_issue(
+                "info", "cobertura",
+                f"{len(e2_in_orig)} especiales con config E2/manual en GD — no pasan por sorter",
+                "Tienen config en el GD origen pero con elementos MAN/EXDOCK (ruta E2). "
+                "No se les asignará posición de rampa — es el comportamiento esperado.",
+                items=[r["playa"] for r in e2_in_orig],
+            ))
+        if fallback_orig:
+            items_detail = [
+                f"{r['playa']}  (día original: {r['dia_orig'] or '?'} → encontrada en: {', '.join(r['found_on_days'][:3])})"
+                for r in fallback_orig[:10]
+            ]
+            issues.append(_issue(
+                "warning", "cobertura",
+                f"{len(fallback_orig)} especiales sin config en el día original — se usará fallback",
+                "Existen en el GD pero no en el día de origen de la parrilla. "
+                "El script buscará el día con más posiciones y lo usará como fuente.",
+                items=items_detail,
+            ))
 
     if sin_config_ninguno:
         issues.append(_issue(
@@ -501,12 +516,24 @@ def validate(parrilla_bytes: bytes, gd_bytes: Optional[bytes] = None) -> List[Di
             canceladas_en_gd.append(r)
 
     if canceladas_en_gd:
+        # Group by playa to show all cancelled days
+        _can_dias: dict = {}
+        for _r in canceladas_en_gd:
+            _p = _r["playa"]
+            if _p not in _can_dias:
+                _can_dias[_p] = []
+            if _r["dia_orig"]:
+                _can_dias[_p].append(_r["dia_orig"])
+        _can_items = [
+            f"{p}  ({', '.join(sorted(set(dias)))})" if dias else p
+            for p, dias in sorted(_can_dias.items())
+        ]
         issues.append(_issue(
             "warning", "cobertura",
-            f"{len(canceladas_en_gd)} canceladas que tienen config en GD (⚠ REVISAR)",
+            f"{len(_can_dias)} canceladas que tienen config en GD (⚠ REVISAR)",
             "Estas playas están marcadas como CANCELADA en la parrilla pero tienen "
             "entradas en el GD origen. Se eliminarán del GD generado — confirma que es correcto.",
-            items=[r["playa"] for r in canceladas_en_gd[:15]],
+            items=_can_items[:20],
         ))
 
     # ── Zona consistency: parrilla E2 vs GD sorter elements ──────────────────
@@ -757,6 +784,37 @@ def validate_output(parrilla_bytes: bytes, gd_output_bytes: bytes) -> List[Dict]
             items=[f"{r['playa']}  (día orig: {r['dia_orig']})" for r in esp_still_orig],
         ))
 
+    # ── Tabla resumen: una línea por pestaña (día) del sort map ─────────────
+    DAYS_ORDER = ["DOMINGO","LUNES","MARTES","MIERCOLES","JUEVES","VIERNES","SABADO"]
+    par_by_dia_new: dict = defaultdict(list)
+    for r in especiales:
+        if r["dia_new"]:
+            par_by_dia_new[r["dia_new"]].append(r["playa"])
+    active_days = sorted(
+        {r["dia_new"] for r in especiales if r["dia_new"]},
+        key=lambda d: DAYS_ORDER.index(d) if d in DAYS_ORDER else 99
+    )
+    lines = []
+    all_ok = True
+    for dia in active_days:
+        esp_llegan   = sorted(set(par_by_dia_new[dia]))
+        sm_presentes = playas_por_dia.get(dia, set())
+        match        = [p for p in esp_llegan if p in sm_presentes]
+        faltantes    = [p for p in esp_llegan if p not in sm_presentes]
+        status = "OK   " if not faltantes else "FALTA"
+        if faltantes: all_ok = False
+        line = f"{status}  {dia:<12}  {len(match)}/{len(esp_llegan)}"
+        if faltantes:
+            line += f"  — falta: {', '.join(faltantes)}"
+        lines.append(line)
+    if lines:
+        issues.append(_issue(
+            "ok" if all_ok else "warning",
+            "resultado",
+            "Resumen por dia: especiales parrilla vs sort map",
+            "\n".join(lines),
+        ))
+
     return issues
 
 
@@ -845,16 +903,10 @@ def validate_zona_consistency(parrilla_bytes: bytes, gd_bytes: bytes) -> List[Di
     if zona_e2_but_sorter:
         issues.append(_issue(
             "warning", "contenido",
-            f"{len(zona_e2_but_sorter)} especiales marcadas como E2 en parrilla pero con elementos sorter en GD",
-            "La parrilla indica zona E2 pero el GD origen tiene posiciones de rampa reales. "
-            "El script usará el GD (las tratará como sorter). Revisar la zona en la parrilla.",
+            f"{len(zona_e2_but_sorter)} especiales con zona E2 en parrilla pero posiciones E3 en GD",
+            "La parrilla indica zona E2 pero el GD origen tiene posiciones de rampa reales (E3). "
+            "La zona en la parrilla es incorrecta — se procesará correctamente usando el GD.",
             items=zona_e2_but_sorter,
-        ))
-    else:
-        issues.append(_issue(
-            "ok", "contenido",
-            "Zonas de especiales consistentes entre parrilla y GD",
-            "No se detectaron especiales marcadas como E2 en parrilla con elementos sorter en GD.",
         ))
 
     return issues
