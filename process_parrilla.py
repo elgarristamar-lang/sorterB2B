@@ -136,20 +136,53 @@ def load_capacity(path):
     return cap
 
 def load_bloque_timings(parrilla_path):
-    """Load Resumen Bloques sheet → {bloque: {lib, cutoff, desac, cluster}}"""
+    """Load Resumen Bloques sheet → {bloque: {lib, cutoff, desac, cluster}}
+    Supports:
+    - S14: sheet named 'Resumen Bloques' with cols [Bloque, Cluster, Liberacion, Cutoff, Desac]
+    - S15: any other sheet whose first two columns look like bloque+cluster codes
+    """
     wb = load_workbook(parrilla_path, read_only=True)
     timings = {}
-    if 'Resumen Bloques' not in wb.sheetnames:
-        return timings
-    ws = wb['Resumen Bloques']
-    for r in ws.iter_rows(values_only=True):
-        if r[0] and isinstance(r[0], str) and not r[0].startswith('=') and r[2]:
-            timings[r[0]] = {
-                'cluster': str(r[1]) if r[1] else '',
-                'lib':     str(r[2]) if r[2] else '',
-                'cutoff':  str(r[3]) if r[3] else '',
-                'desac':   str(r[4]) if r[4] else '',
-            }
+
+    def _try_load(ws):
+        result = {}
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows: return result
+        # Detect header vs data rows: skip rows where col0 matches 'Bloque'/'BLOQUE'/etc.
+        for r in rows:
+            v0 = str(r[0] or '').strip()
+            if not v0 or v0.lower() in ('bloque', 'block', '') or v0.startswith('='): continue
+            # Detect S15 format: cols are Bloque, Cluster, Lib, Cutoff, Desac
+            # Col indices may vary — find them by content pattern
+            # Bloque looks like '1BLOD0', cluster like 'D0'
+            if not re.match(r'^\d+BLO[A-Z]\d+$', v0): continue
+            lib   = str(r[2] or '').strip() if len(r) > 2 else ''
+            cutoff= str(r[3] or '').strip() if len(r) > 3 else ''
+            desac = str(r[4] or '').strip() if len(r) > 4 else ''
+            cluster = str(r[1] or '').strip() if len(r) > 1 else ''
+            if lib:
+                result[v0] = {'cluster': cluster, 'lib': lib, 'cutoff': cutoff, 'desac': desac}
+        return result
+
+    # Priority 1: named 'Resumen Bloques'
+    if 'Resumen Bloques' in wb.sheetnames:
+        timings = _try_load(wb['Resumen Bloques'])
+        if timings: return timings
+
+    # Priority 2: any sheet (except the main data sheet) that has bloque data
+    main_sheets = set()
+    for sh in wb.sheetnames:
+        ws_tmp = wb[sh]
+        hdr = next(ws_tmp.iter_rows(values_only=True, max_row=1), ())
+        if any(str(h or '').strip().upper() == 'TIPO_SALIDA' for h in hdr):
+            main_sheets.add(sh)
+    for sh in wb.sheetnames:
+        if sh in main_sheets: continue
+        t = _try_load(wb[sh])
+        if t:
+            timings = t
+            print(f"  Timings de bloques leídos de hoja alternativa: '{sh}'")
+            break
     return timings
 
 def load_grupo_destinos(path):
@@ -219,15 +252,40 @@ def load_parrilla(path, sheet_name):
         def g(c, d=''):
             i = col.get(c)
             return safe_str(row[i]) if i is not None and row[i] is not None else d
-        r = {'dia_playa': g('DIA_PLAYA') or g('DIA_PLAYA_NEW'),
-             'playa': g('PLAYA') or g('AGRUPACION_PLAYA'),
-             'dia_salida': g('DIA_SALIDA') or g('DIA_SALIDA_ORIGINAL'),
+        tipo_sal = g('TIPO_SALIDA').upper()
+        dpn  = g('DIA_PLAYA_NEW')
+        dpo  = g('DIA_PLAYA_ORIGINAL')
+        # Extract playa: for especiales use DIA_PLAYA_ORIGINAL (GD is keyed on orig day)
+        # For cancelladas and regulares use DIA_PLAYA_NEW / PLAYA col
+        playa = g('PLAYA') or g('AGRUPACION_PLAYA')
+        if not playa:
+            src_field = dpo if tipo_sal == 'ESPECIAL DIA CAMBIO' and dpo else dpn
+            if src_field:
+                _su = src_field.upper()
+                if _su.startswith('CANCELADA_') or _su.startswith('CANCELADO_'):
+                    playa = src_field[src_field.index('_')+1:].strip()
+                else:
+                    _dm = re.match(
+                        r'^(?:DOMINGO|LUNES|MARTES|MIERCOLES|MIÉRCOLES|JUEVES|VIERNES|SABADO)_(.+)$',
+                        src_field, re.IGNORECASE)
+                    playa = _dm.group(1).strip() if _dm else src_field
+        # Derive dia_salida from DIA_PLAYA_ORIGINAL when DIA_SALIDA_ORIGINAL missing
+        dia_salida = g('DIA_SALIDA') or g('DIA_SALIDA_ORIGINAL')
+        if not dia_salida and dpo:
+            _ddm = re.match(
+                r'^(DOMINGO|LUNES|MARTES|MIERCOLES|MIÉRCOLES|JUEVES|VIERNES|SABADO)_',
+                dpo, re.IGNORECASE)
+            if _ddm: dia_salida = _ddm.group(1).upper()
+        r = {'dia_playa': g('DIA_PLAYA') or dpn,
+             'playa': playa,
+             'dia_salida': dia_salida,
              'cutoff': g('CUTOFF') or g('CUTOFF_NEW'),
              'dia_salida_new': g('DIA_SALIDA_NEW'),
              'bloque': g('BLOQUE'),
              'nomenclatura': g('NOMENCLATURA'),
-             'tipo_salida': g('TIPO_SALIDA'),
+             'tipo_salida': tipo_sal,
              'id_cluster': g('ID_CLUSTER'),
+             'id_cluster_new': g('ID_CLUSTER_NEW'),
              'mantener_original': g('MANTENER_ORIGINAL','').strip().upper() == 'SI'}
         if r['playa'] and r['tipo_salida']:
             records.append(r)
@@ -587,14 +645,31 @@ def load_especial_bloque_map(parrilla_path):
             if result:
                 return result
 
-        # --- S18 format: derive bloque from the cluster part that CHANGED ---
+        # --- S15/S18 format: derive bloque from the cluster part that CHANGED ---
         # ID_CLUSTER_NEW = ID_CLUSTER with the old day's cluster replaced by new day's
         # The new special block is the part in ID_CLUSTER_NEW not present in ID_CLUSTER
-        _cb = {}
+        _cb = {}  # cluster_code → bloque_name
+        # Find the bloques sheet: prefer 'Resumen Bloques', else any sheet with bloque codes
+        _bloques_sheet = None
         if 'Resumen Bloques' in wb.sheetnames:
-            for _r in wb['Resumen Bloques'].iter_rows(values_only=True):
-                if _r[0] and _r[1] and str(_r[0]).strip() not in ('Bloque', ''):
-                    _cb[str(_r[1]).strip().upper()] = str(_r[0]).strip()
+            _bloques_sheet = 'Resumen Bloques'
+        else:
+            for _sh in wb.sheetnames:
+                _ws_b = wb[_sh]
+                _hdr_b = next(_ws_b.iter_rows(values_only=True, max_row=1), ())
+                _hdr_b_up = [str(h or '').strip().upper() for h in _hdr_b]
+                if any('BLOQUE' in h or 'CLUSTER' in h for h in _hdr_b_up):
+                    # Verify it has actual bloque data (1BLO... pattern)
+                    _sample = list(_ws_b.iter_rows(values_only=True, max_row=5))
+                    if any(_r and _r[0] and re.match(r'^\d+BLO', str(_r[0] or '')) for _r in _sample[1:]):
+                        _bloques_sheet = _sh
+                        break
+        if _bloques_sheet:
+            for _r in wb[_bloques_sheet].iter_rows(values_only=True):
+                v0 = str(_r[0] or '').strip()
+                v1 = str(_r[1] or '').strip()
+                if v0 and v1 and v0.lower() not in ('bloque', 'block', '') and not v0.startswith('='):
+                    _cb[v1.upper()] = v0  # cluster → bloque
 
         def _get_new_cluster(id_cluster, id_cluster_new):
             """The new special block = the part in ID_CLUSTER_NEW not in ID_CLUSTER."""
@@ -622,8 +697,14 @@ def load_especial_bloque_map(parrilla_path):
                 dpn            = str(r[col2.get('DIA_PLAYA_NEW', 1)] or '').strip()
                 id_cluster     = str(r[col2.get('ID_CLUSTER', 8)] or '').strip()
                 id_cluster_new = str(r[col2.get('ID_CLUSTER_NEW', 9)] or '').strip()
-                m = _DAY_PFX.match(dpn)
-                playa = dpn[m.end():].strip() if m else str(r[col2.get('AGRUPACION_PLAYA', 3)] or '').strip()
+                dpo2 = str(r[col2.get('DIA_PLAYA_ORIGINAL', 2)] or '').strip()
+                # For especiales: extract playa from DIA_PLAYA_ORIGINAL (authoritative)
+                if dpo2:
+                    _mo = _DAY_PFX.match(dpo2)
+                    playa = dpo2[_mo.end():].strip() if _mo else ''
+                if not playa:
+                    m = _DAY_PFX.match(dpn)
+                    playa = dpn[m.end():].strip() if m else str(r[col2.get('AGRUPACION_PLAYA', 3)] or '').strip()
                 if not playa or not dia_new: continue
                 # New block = the cluster part that changed (not in original ID_CLUSTER)
                 new_cluster = _get_new_cluster(id_cluster, id_cluster_new)
@@ -637,17 +718,21 @@ def load_especial_bloque_map(parrilla_path):
 
 def load_cancelled_especiales(parrilla_path):
     """
-    Read the 'SEMANA SANTA W*' sheet and return a set of playa names
-    that are tipo=CANCELADA — these are especiales that got cancelled.
+    Return set of playa names with tipo=CANCELADA.
+    Supports S14 (SEMANA SANTA sheet) and S15 (unified Hoja1).
+    Also handles CANCELADO_ (masculine) prefix variant.
     """
     from openpyxl import load_workbook as _lwb_c
-    import re as _re_c
     cancelled = set()
     try:
         wb = _lwb_c(parrilla_path, read_only=True)
+        # Find best sheet: prefer SEMANA SANTA, else any sheet with TIPO_SALIDA
         sheet = next((s for s in wb.sheetnames
-                      if re.search(r'SEMANA.SANTA', s, re.IGNORECASE)
-                      or re.search(r'W\d+', s)), None)
+                      if re.search(r'SEMANA.SANTA', s, re.IGNORECASE)), None)
+        if not sheet:
+            sheet = next((s for s in wb.sheetnames
+                          if any(str(h or '').strip().upper() == 'TIPO_SALIDA'
+                                 for h in next(wb[s].iter_rows(values_only=True, max_row=1), []))), None)
         if not sheet:
             return cancelled
         rows = list(wb[sheet].iter_rows(values_only=True))
@@ -656,13 +741,19 @@ def load_cancelled_especiales(parrilla_path):
             if str(r[hdr.get('TIPO_SALIDA', 99)] or '').strip().upper() != 'CANCELADA':
                 continue
             dpn = str(r[hdr.get('DIA_PLAYA_NEW', 1)] or '').strip()
-            # "CANCELADA_ESPANA_BALEARES_TSA" → "ESPANA_BALEARES_TSA"
-            if dpn.upper().startswith('CANCELADA_'):
-                cancelled.add(dpn[10:].strip().upper())
+            dpo = str(r[hdr.get('DIA_PLAYA_ORIGINAL', 2)] or '').strip()
+            su  = dpn.upper()
+            if su.startswith('CANCELADA_') or su.startswith('CANCELADO_'):
+                cancelled.add(dpn[dpn.index('_')+1:].strip().upper())
+            elif dpo:
+                # Extract from DIA_PLAYA_ORIGINAL: "LUNES_ESPANA_X" → "ESPANA_X"
+                _m = re.match(
+                    r'^(?:DOMINGO|LUNES|MARTES|MIERCOLES|JUEVES|VIERNES|SABADO)_(.+)$',
+                    dpo, re.IGNORECASE)
+                if _m: cancelled.add(_m.group(1).strip().upper())
             else:
-                m = _re_c.match(r'(?:\w+)_(.+)', dpn)
-                if m:
-                    cancelled.add(m.group(1).strip().upper())
+                _m = re.match(r'(?:\w+)_(.+)', dpn)
+                if _m: cancelled.add(_m.group(1).strip().upper())
     except Exception:
         pass
     return cancelled
