@@ -58,13 +58,25 @@ def parse_gd_desc(desc):
     core = re.sub(r'^\[B2B\]\s*', '', str(desc)).strip()
     core = re.sub(r'\s+PARA BAJAR POR.*$', '', core)
     core = re.sub(r'_CANCELADA.*$', '', core)
+    # Some GD descriptions inject "_ESPECIAL_" between the bloque and the day:
+    #   3BLOD4_ESPECIAL_MIERCOLES_JORDANIA → 3BLOD4_MIERCOLES_JORDANIA
+    core = re.sub(r'_ESPECIAL_', '_', core, flags=re.IGNORECASE)
     m = BLOQUE_RE.match(core)
-    if not m: return None, None, None
-    bloque, rest = m.group(1), m.group(2)
+    if m:
+        bloque, rest = m.group(1), m.group(2)
+        for d in DAYS:
+            if rest.upper().startswith(d + '_'):
+                return bloque, d.replace('MIÉRCOLES','MIERCOLES'), rest[len(d)+1:]
+        return bloque, None, rest
+    # No bloque prefix. Handle IRREGULAR_<PLAYA> and DIA_<PLAYA> forms so these
+    # entries are still recognised as belonging to a playa (no bloque/day info).
+    m2 = re.match(r'^IRREGULAR_(.+)$', core, re.IGNORECASE)
+    if m2:
+        return None, None, m2.group(1)
     for d in DAYS:
-        if rest.upper().startswith(d + '_'):
-            return bloque, d.replace('MIÉRCOLES','MIERCOLES'), rest[len(d)+1:]
-    return bloque, None, rest
+        if core.upper().startswith(d + '_'):
+            return None, d.replace('MIÉRCOLES','MIERCOLES'), core[len(d)+1:]
+    return None, None, None
 
 def safe_str(val):
     if val is None: return ''
@@ -536,6 +548,28 @@ def get_slot_structure(postex_entries, sorexp_entries):
     return slots, dict(rampa_dests), alm_p, alm_s
 
 
+def _resolve_gd_playa(playa, by_dia_playa):
+    """
+    Map a parrilla playa name to the name actually used in the GD.
+    Handles disambiguating suffixes that exist in one but not the other:
+      - MALASIA_CPT_2 (parrilla) ↔ MALASIA_CPT (GD)
+    Returns the GD playa name to use, or the original if no better match.
+    """
+    gd_playas = {p for (_d, p) in by_dia_playa.keys()}
+    if playa in gd_playas:
+        return playa
+    # Try stripping a trailing _<number> suffix: MALASIA_CPT_2 → MALASIA_CPT
+    stripped = re.sub(r'_\d+$', '', playa)
+    if stripped != playa and stripped in gd_playas:
+        return stripped
+    # Try the reverse: parrilla has the base, GD has a numbered variant.
+    # Only accept if there is exactly one GD candidate to avoid wrong matches.
+    cand = [p for p in gd_playas if re.sub(r'_\d+$', '', p) == playa]
+    if len(cand) == 1:
+        return cand[0]
+    return playa
+
+
 def assign_especial(orig_dia, orig_playa, new_dia, raw_bloque, id_cluster,
                     by_dia_playa, tagged, capacity, bloque_timings, freed_in_new_dia,
                     run_occ_new_dia=None, preferred_rampas=None, all_especial_playas=None,
@@ -553,6 +587,13 @@ def assign_especial(orig_dia, orig_playa, new_dia, raw_bloque, id_cluster,
         return [], {'status':'E2_ROUTE','playa':orig_playa,'dia_orig':orig_dia,'dia_new':new_dia,
                     'msg':'Ruta E2/manual (MAN/EXDOCK) — no pasa por rampas del sorter'}
 
+    # Resolve the playa name against the GD. The parrilla sometimes uses a
+    # disambiguating suffix (MALASIA_CPT_2) that the GD doesn't have (MALASIA_CPT),
+    # or vice-versa. If the exact name has no GD entries, try variants.
+    gd_playa = _resolve_gd_playa(orig_playa, by_dia_playa)
+    if gd_playa and gd_playa != orig_playa:
+        orig_playa = gd_playa
+
     new_bloque = None
     if raw_bloque and raw_bloque not in ('#N/A','NO_BLOQUE','?',''):
         new_bloque = raw_bloque
@@ -567,15 +608,29 @@ def assign_especial(orig_dia, orig_playa, new_dia, raw_bloque, id_cluster,
     if not postex_orig:
         best_day, fallback = find_best_source_day(orig_playa, orig_dia, by_dia_playa)
         if not best_day:
-            all_p  = [e for v in by_dia_playa.values() for e in v if e['playa'] == orig_playa]
-            status = 'E2_ROUTE' if all_p else 'NO_CONFIG'
-            msg    = ('Ruta E2/manual — elementos no son rampas estándar' if all_p
-                      else 'Sin configuración GD en ningún día')
-            return [], {'status':status,'playa':orig_playa,'dia_orig':orig_dia,'dia_new':new_dia,'msg':msg}
-        postex_orig = fallback
-        sorexp_orig = [e for e in by_dia_playa.get((best_day, orig_playa),[])
-                       if e['tipo_zona'] == 'SOREXP' and e['is_sorter']]
-        source_day  = best_day
+            # Last-resort: scan the full tagged GD for any sorter POSTEX entries of
+            # this playa, even if they have no day (e.g. IRREGULAR_SUIZA_FCA, which
+            # carries a real rampa position but no DIA in its description).
+            _dayless = [e for e in tagged
+                        if e.get('playa') == orig_playa
+                        and e['tipo_zona'] == 'POSTEX' and e['is_sorter']]
+            if _dayless:
+                postex_orig = _dayless
+                sorexp_orig = [e for e in tagged
+                               if e.get('playa') == orig_playa
+                               and e['tipo_zona'] == 'SOREXP' and e['is_sorter']]
+                source_day  = orig_dia  # keep parrilla's day as the nominal source
+            else:
+                all_p  = [e for v in by_dia_playa.values() for e in v if e['playa'] == orig_playa]
+                status = 'E2_ROUTE' if all_p else 'NO_CONFIG'
+                msg    = ('Ruta E2/manual — elementos no son rampas estándar' if all_p
+                          else 'Sin configuración GD en ningún día')
+                return [], {'status':status,'playa':orig_playa,'dia_orig':orig_dia,'dia_new':new_dia,'msg':msg}
+        else:
+            postex_orig = fallback
+            sorexp_orig = [e for e in by_dia_playa.get((best_day, orig_playa),[])
+                           if e['tipo_zona'] == 'SOREXP' and e['is_sorter']]
+            source_day  = best_day
 
     # Build slot structure: N unique (rampa,pos) → list of destinos each
     slots, _, alm_postex, alm_sorexp = get_slot_structure(postex_orig, sorexp_orig)
@@ -1522,13 +1577,17 @@ def main():
                 _desc = str(_r[2] or '')
                 _renamed = _desc
                 for _cp in cancelled_especiales:
-                    if _cp in _desc.upper() and '_CANCELADA_SOLO_W14' not in _desc:
-                        # Find exact case match
-                        _m = _re_post.search(_re_post.escape(_cp), _desc, _re_post.IGNORECASE)
-                        if _m:
-                            _match_str = _m.group(0)
-                            _renamed = _desc.replace(_match_str, _match_str + '_CANCELADA_SOLO_W14', 1)
-                            break
+                    if '_CANCELADA_SOLO_W14' in _desc:
+                        break
+                    # Whole-token match: the playa must be followed by a boundary
+                    # (end, space, '(', or '_' that is NOT a digit — so TSA does not
+                    # match TSA3, and CATALUNYA_TSA does not match CATALUNYA_TSA3).
+                    _pat = _re_post.escape(_cp) + r'(?![0-9A-Z])'
+                    _m = _re_post.search(_pat, _desc, _re_post.IGNORECASE)
+                    if _m:
+                        _match_str = _m.group(0)
+                        _renamed = _desc.replace(_match_str, _match_str + '_CANCELADA_SOLO_W14', 1)
+                        break
                 out.append((_r[0], _r[1], _renamed, _r[3], _r[4], _r[5], _r[6]))
             return out
         output_rows = _rename_if_cancelled(output_rows)
