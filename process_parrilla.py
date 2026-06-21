@@ -147,7 +147,7 @@ def load_bloque_timings(parrilla_path):
     - S14: sheet named 'Resumen Bloques' with cols [Bloque, Cluster, Liberacion, Cutoff, Desac]
     - S15: any other sheet whose first two columns look like bloque+cluster codes
     """
-    wb = load_workbook(parrilla_path, read_only=True)
+    wb = load_workbook(parrilla_path, read_only=True, data_only=True)
     timings = {}
 
     def _try_load(ws):
@@ -247,7 +247,7 @@ def load_grupo_destinos(path):
     return out_header, tagged, by_dia_playa
 
 def load_parrilla(path, sheet_name):
-    wb = load_workbook(path, read_only=True)
+    wb = load_workbook(path, read_only=True, data_only=True)
     if sheet_name not in wb.sheetnames:
         raise ValueError(f"Hoja '{sheet_name}' no encontrada. Disponibles: {', '.join(wb.sheetnames)}")
     ws = wb[sheet_name]
@@ -261,11 +261,21 @@ def load_parrilla(path, sheet_name):
         tipo_sal = g('TIPO_SALIDA').upper()
         dpn  = g('DIA_PLAYA_NEW')
         dpo  = g('DIA_PLAYA_ORIGINAL')
+        # DIA_PLAYA: present in both formats.
+        #  - Old format: a plain "PLAYA" col exists, DIA_PLAYA_NEW/ORIGINAL carry the day info
+        #  - New unified format (S26+): DIA_PLAYA = "<DIA_SALIDA>_<PLAYA>" and there is
+        #    NO DIA_PLAYA_NEW/ORIGINAL nor DIA_SALIDA_NEW. The day in DIA_PLAYA is already
+        #    the NEW expedition day. The new bloque/day comes from TURNO_REPARTO (e.g. D4, L4).
+        dia_playa_val = g('DIA_PLAYA')
+        turno = g('TURNO_REPARTO')
+
         # Extract playa: for especiales use DIA_PLAYA_ORIGINAL (GD is keyed on orig day)
         # For cancelladas and regulares use DIA_PLAYA_NEW / PLAYA col
         playa = g('PLAYA') or g('AGRUPACION_PLAYA')
         if not playa:
-            src_field = dpo if tipo_sal == 'ESPECIAL DIA CAMBIO' and dpo else dpn
+            # Prefer DIA_PLAYA_ORIGINAL (old especiales), then DIA_PLAYA_NEW, then DIA_PLAYA (new format)
+            _is_esp = 'ESPECIAL' in tipo_sal and 'DIA' in tipo_sal
+            src_field = (dpo if _is_esp and dpo else dpn) or dia_playa_val
             if src_field:
                 _su = src_field.upper()
                 if _su.startswith('CANCELADA_') or _su.startswith('CANCELADO_'):
@@ -275,18 +285,37 @@ def load_parrilla(path, sheet_name):
                         r'^(?:DOMINGO|LUNES|MARTES|MIERCOLES|MIÉRCOLES|JUEVES|VIERNES|SABADO)_(.+)$',
                         src_field, re.IGNORECASE)
                     playa = _dm.group(1).strip() if _dm else src_field
-        # Derive dia_salida from DIA_PLAYA_ORIGINAL when DIA_SALIDA_ORIGINAL missing
+
+        # ── Determine dia_salida (the ORIGINAL day, GD is keyed on it) ────────
         dia_salida = g('DIA_SALIDA') or g('DIA_SALIDA_ORIGINAL')
         if not dia_salida and dpo:
             _ddm = re.match(
                 r'^(DOMINGO|LUNES|MARTES|MIERCOLES|MIÉRCOLES|JUEVES|VIERNES|SABADO)_',
                 dpo, re.IGNORECASE)
             if _ddm: dia_salida = _ddm.group(1).upper()
-        r = {'dia_playa': g('DIA_PLAYA') or dpn,
+        # New format: derive from DIA_PLAYA prefix if still missing
+        if not dia_salida and dia_playa_val:
+            _ddm2 = re.match(
+                r'^(DOMINGO|LUNES|MARTES|MIERCOLES|MIÉRCOLES|JUEVES|VIERNES|SABADO)_',
+                dia_playa_val, re.IGNORECASE)
+            if _ddm2: dia_salida = _ddm2.group(1).upper()
+        dia_salida = dia_salida.upper() if dia_salida else ''
+
+        # ── Determine dia_salida_new (the NEW expedition day) ────────────────
+        dia_salida_new = g('DIA_SALIDA_NEW')
+        # New format: there is no DIA_SALIDA_NEW. For especiales the new day is
+        # encoded in TURNO_REPARTO's first letter (D=DOMINGO, L=LUNES, M=MARTES,
+        # X=MIERCOLES, J=JUEVES, V=VIERNES, S=SABADO).
+        if not dia_salida_new and turno:
+            _letra_turno = turno.strip()[0].upper() if turno.strip() else ''
+            dia_salida_new = CLUSTER_DAY.get(_letra_turno, '')
+
+        r = {'dia_playa': dia_playa_val or dpn,
              'playa': playa,
              'dia_salida': dia_salida,
              'cutoff': g('CUTOFF') or g('CUTOFF_NEW'),
-             'dia_salida_new': g('DIA_SALIDA_NEW'),
+             'dia_salida_new': dia_salida_new.upper() if dia_salida_new else '',
+             'turno_reparto': turno,
              'bloque': g('BLOQUE'),
              'nomenclatura': g('NOMENCLATURA'),
              'tipo_salida': tipo_sal,
@@ -621,10 +650,12 @@ def assign_especial(orig_dia, orig_playa, new_dia, raw_bloque, id_cluster,
 # ─── PROCESS ──────────────────────────────────────────────────────────────────
 
 
-def load_especial_bloque_map(parrilla_path):
+def load_especial_bloque_map(parrilla_path, sheet_name=None):
     """
     Read especial bloque assignments from the parrilla workbook.
-    Supports two formats:
+    Supports three formats:
+    - S26+ (unified, current): the selected parrilla sheet has BLOQUE populated
+      directly (1BLOD4, 2BLOL4...) and the new day comes from TURNO_REPARTO.
     - S14: reads 'SEMANA SANTA W*' sheet (has BLOQUE column directly)
     - S18: reads parrilla_test_* sheet (derives bloque from ID_CLUSTER_NEW + Resumen Bloques)
     Returns {(dia_new_upper, playa): bloque}
@@ -634,8 +665,51 @@ def load_especial_bloque_map(parrilla_path):
     result = {}
     _DAY_PFX = _re.compile(
         r'^(DOMINGO|LUNES|MARTES|MIERCOLES|JUEVES|VIERNES|SABADO)_', _re.IGNORECASE)
+    _LETRA_DIA = {'D':'DOMINGO','L':'LUNES','M':'MARTES','X':'MIERCOLES',
+                  'J':'JUEVES','V':'VIERNES','S':'SABADO'}
     try:
-        wb = _lw(str(parrilla_path), read_only=True)
+        wb = _lw(str(parrilla_path), read_only=True, data_only=True)
+
+        # --- S26+ format: BLOQUE present directly in the selected event sheet ---
+        # Use the provided sheet_name; the new day is derived from TURNO_REPARTO.
+        _target = None
+        if sheet_name and sheet_name in wb.sheetnames:
+            _hdr_probe = next(wb[sheet_name].iter_rows(values_only=True, max_row=1), ())
+            if any(str(h or '').strip().upper() == 'TIPO_SALIDA' for h in _hdr_probe):
+                _target = sheet_name
+        if _target:
+            ws = wb[_target]
+            rows = list(ws.iter_rows(values_only=True))
+            col = {str(h or '').strip().upper(): i for i, h in enumerate(rows[0]) if h}
+            has_turno  = 'TURNO_REPARTO' in col
+            has_bloque = 'BLOQUE' in col
+            has_dpold  = 'DIA_PLAYA_NEW' in col or 'DIA_PLAYA_ORIGINAL' in col
+            # Only use this branch for the NEW format (no DIA_PLAYA_NEW, has TURNO_REPARTO+BLOQUE)
+            if has_turno and has_bloque and not has_dpold:
+                for r in rows[1:]:
+                    def _gv(c):
+                        i = col.get(c)
+                        if i is None or i >= len(r) or r[i] is None: return ''
+                        s = str(r[i]).strip()
+                        return '' if s.startswith('=') or s == '#N/A' else s
+                    tipo = _gv('TIPO_SALIDA').upper()
+                    if not ('ESPECIAL' in tipo and 'DIA' in tipo):
+                        continue
+                    bloque = _gv('BLOQUE')
+                    if not bloque or bloque.upper() in ('#N/A','NO_BLOQUE','--',''):
+                        continue
+                    turno = _gv('TURNO_REPARTO')
+                    dia_new = _LETRA_DIA.get(turno[:1].upper(), '') if turno else ''
+                    if not dia_new:
+                        continue
+                    dpl = _gv('DIA_PLAYA')
+                    m = _DAY_PFX.match(dpl)
+                    playa = dpl[m.end():].strip() if m else (_gv('PLAYA') or _gv('AGRUPACION_PLAYA'))
+                    if not playa:
+                        continue
+                    result[(dia_new.upper(), playa.upper())] = bloque
+                if result:
+                    return result
 
         # --- Try S14 format: SEMANA SANTA sheet with BLOQUE column ---
         ss_sheet = next((s for s in wb.sheetnames
@@ -728,19 +802,25 @@ def load_especial_bloque_map(parrilla_path):
     return result
 
 
-def load_cancelled_especiales(parrilla_path):
+def load_cancelled_especiales(parrilla_path, sheet_name=None):
     """
-    Return set of playa names with tipo=CANCELADA.
-    Supports S14 (SEMANA SANTA sheet) and S15 (unified Hoja1).
+    Return set of playa names with tipo=CANCELADA (or CANCELADA (MOVIDO...)).
+    Supports S14 (SEMANA SANTA sheet), S15 (unified Hoja1) and S26+ (selected event sheet).
     Also handles CANCELADO_ (masculine) prefix variant.
     """
     from openpyxl import load_workbook as _lwb_c
     cancelled = set()
     try:
-        wb = _lwb_c(parrilla_path, read_only=True)
-        # Find best sheet: prefer SEMANA SANTA, else any sheet with TIPO_SALIDA
-        sheet = next((s for s in wb.sheetnames
-                      if re.search(r'SEMANA.SANTA', s, re.IGNORECASE)), None)
+        wb = _lwb_c(parrilla_path, read_only=True, data_only=True)
+        # Sheet priority: explicit sheet_name → SEMANA SANTA → any sheet with TIPO_SALIDA
+        sheet = None
+        if sheet_name and sheet_name in wb.sheetnames:
+            _hp = next(wb[sheet_name].iter_rows(values_only=True, max_row=1), ())
+            if any(str(h or '').strip().upper() == 'TIPO_SALIDA' for h in _hp):
+                sheet = sheet_name
+        if not sheet:
+            sheet = next((s for s in wb.sheetnames
+                          if re.search(r'SEMANA.SANTA', s, re.IGNORECASE)), None)
         if not sheet:
             sheet = next((s for s in wb.sheetnames
                           if any(str(h or '').strip().upper() == 'TIPO_SALIDA'
@@ -749,23 +829,49 @@ def load_cancelled_especiales(parrilla_path):
             return cancelled
         rows = list(wb[sheet].iter_rows(values_only=True))
         hdr = {str(h).strip().upper(): i for i, h in enumerate(rows[0]) if h}
+
+        _PLAYA_RE = re.compile(
+            r'^(?:DOMINGO|LUNES|MARTES|MIERCOLES|MIÉRCOLES|JUEVES|VIERNES|SABADO)_(.+)$',
+            re.IGNORECASE)
+
+        def _cell(row, colname):
+            i = hdr.get(colname)
+            if i is None or i >= len(row) or row[i] is None:
+                return ''
+            return str(row[i]).strip()
+
+        def _extract_playa_name(val):
+            """CANCELADA_X → X ; DIA_X → X ; else val."""
+            if not val:
+                return ''
+            vu = val.upper()
+            if vu.startswith('CANCELADA_') or vu.startswith('CANCELADO_'):
+                return val[val.index('_')+1:].strip().upper()
+            m = _PLAYA_RE.match(val)
+            return (m.group(1).strip().upper() if m else val.strip().upper())
+
+        ti = hdr.get('TIPO_SALIDA')
         for r in rows[1:]:
-            if str(r[hdr.get('TIPO_SALIDA', 99)] or '').strip().upper() != 'CANCELADA':
+            _tipo = (str(r[ti]).strip().upper() if ti is not None and ti < len(r) and r[ti] else '')
+            if not _tipo.startswith('CANCELADA'):
                 continue
-            dpn = str(r[hdr.get('DIA_PLAYA_NEW', 1)] or '').strip()
-            dpo = str(r[hdr.get('DIA_PLAYA_ORIGINAL', 2)] or '').strip()
-            su  = dpn.upper()
-            if su.startswith('CANCELADA_') or su.startswith('CANCELADO_'):
-                cancelled.add(dpn[dpn.index('_')+1:].strip().upper())
-            elif dpo:
-                # Extract from DIA_PLAYA_ORIGINAL: "LUNES_ESPANA_X" → "ESPANA_X"
-                _m = re.match(
-                    r'^(?:DOMINGO|LUNES|MARTES|MIERCOLES|JUEVES|VIERNES|SABADO)_(.+)$',
-                    dpo, re.IGNORECASE)
-                if _m: cancelled.add(_m.group(1).strip().upper())
-            else:
-                _m = re.match(r'(?:\w+)_(.+)', dpn)
-                if _m: cancelled.add(_m.group(1).strip().upper())
+            # Source columns in priority order. Use explicit name lookups; never
+            # fall back to a positional default (that grabs the wrong column).
+            dpn = _cell(r, 'DIA_PLAYA_NEW')
+            dpo = _cell(r, 'DIA_PLAYA_ORIGINAL')
+            dpl = _cell(r, 'DIA_PLAYA')
+            playa_col = _cell(r, 'PLAYA') or _cell(r, 'AGRUPACION_PLAYA')
+
+            playa = ''
+            for src in (dpn, dpo, dpl):
+                if src:
+                    playa = _extract_playa_name(src)
+                    if playa:
+                        break
+            if not playa and playa_col:
+                playa = playa_col.upper()
+            if playa:
+                cancelled.add(playa)
     except Exception:
         pass
     return cancelled
@@ -778,11 +884,19 @@ def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, fi
         playa, tipo = r['playa'], r['tipo_salida']
         dia_orig = r['dia_salida']
         dia_new  = r['dia_salida_new'] or dia_orig
-        if tipo == 'CANCELADA':
+        # Classify by tipo (order matters):
+        #  - CANCELADA / CANCELADA (MOVIDO...) → cancelada
+        #  - any ESPECIAL with DIA in the name (ESPECIAL DIA, ESPECIAL DIA+CUTOFF,
+        #    ESPECIAL DIA + CUTOFF, ESPECIAL DIA CAMBIO) → especial (day change)
+        #  - HABITUAL/REGULAR/ESPECIAL CUTOFF/BI SEMANAL → habitual (no day change)
+        _tipo_up = tipo.upper().strip()
+        if _tipo_up.startswith('CANCELADA'):
             canceladas[(dia_orig, playa)] = r
-        elif tipo == 'ESPECIAL DIA CAMBIO' and dia_new and dia_new != dia_orig:
-            especiales[(dia_orig, playa)] = (dia_new, r)
-        elif tipo in ('HABITUAL','REGULAR','ESPECIAL CUTOFF'):
+        elif 'ESPECIAL' in _tipo_up and 'DIA' in _tipo_up:
+            # day change special. dia_new defaults to dia_orig if it couldn't be
+            # derived — assign_especial self-corrects the source day via fallback.
+            especiales[(dia_orig, playa)] = (dia_new or dia_orig, r)
+        elif _tipo_up in ('HABITUAL', 'REGULAR', 'ESPECIAL CUTOFF', 'BI SEMANAL'):
             habituales[(dia_orig, playa)] = r
 
     freed_per_day = defaultdict(set)
@@ -1351,8 +1465,8 @@ def main():
     superplaya_map  = load_superplaya(superplaya_path)
     if superplaya_map:
         print(f"  Superplayas cargadas: {len(set(superplaya_map.values()))} grupos")
-    especial_bloque_map = load_especial_bloque_map(parrilla_path)
-    cancelled_especiales = load_cancelled_especiales(parrilla_path)
+    especial_bloque_map = load_especial_bloque_map(parrilla_path, sheet_name)
+    cancelled_especiales = load_cancelled_especiales(parrilla_path, sheet_name)
     print(f"  Canceladas en SEMANA SANTA: {len(cancelled_especiales)} playas")
     if especial_bloque_map:
         print(f"  Bloque map (SEMANA SANTA): {len(especial_bloque_map)} entradas")
