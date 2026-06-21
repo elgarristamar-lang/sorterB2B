@@ -1,4 +1,4 @@
-# Version: 0.02
+# Version: 0.03
 # sorter_map_excel_por_dia.py
 # ---------------------------------------------------------
 # Genera un Excel "Sorter Map" en formato slots:
@@ -1476,7 +1476,7 @@ def write_validation_sheet(ws, grupo_df, cap_map, block_intervals,
     ws.freeze_panes = "A3"
 
 def main():
-    print("=== Generador SORTER_MAP Excel (1 pestaña por día) ===")
+    print("=== Generador SORTER_MAP Excel v0.03 (formato S26+) ===")
 
     cap_map = load_capacity(CAPACITY_CSV)
     grupo = load_grupo_destinos(GRUPO_XLSX, GRUPO_SHEET)
