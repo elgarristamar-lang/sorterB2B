@@ -1,23 +1,111 @@
-# Version: 0.08
+# Version: 0.09
 import streamlit as st
 import subprocess, sys, tempfile, datetime as dt
 from pathlib import Path
 
 BASE_DIR = Path(__file__).parent
 
+# ── Hojas base que NO son hojas de evento especial ───────────────────────────
+_BASE_SHEET_NAMES = {
+    "B2B", "B2C", "BLOQUES", "RESUMEN BLOQUES", "VOLUMENES", "APY",
+}
+
+def _is_event_sheet(sheet_name: str, headers: tuple) -> bool:
+    """Return True if this sheet is an event/agenda sheet (not a base sheet)."""
+    su = sheet_name.strip().upper()
+    # Exclude known base sheet names
+    if su in _BASE_SHEET_NAMES:
+        return False
+    # Exclude "Bloques *" sheets (sub-tables embedded in parrilla)
+    if su.startswith("BLOQUES"):
+        return False
+    # Must have TIPO_SALIDA column
+    if not any(str(h or "").strip().upper() == "TIPO_SALIDA" for h in headers):
+        return False
+    return True
+
+def _detect_bloques_sheet(wb, event_sheet: str) -> str | None:
+    """
+    Find the matching Bloques sheet for a given event sheet.
+    Tries: 'Bloques ' + event suffix, then any sheet starting with 'Bloques'.
+    """
+    sheets = wb.sheetnames
+    # Derive suffix: "AGENDA S26 Sant Joan" → "S26 Sant Joan"
+    su = event_sheet.strip()
+    for prefix in ("AGENDA ", "SEMANA SANTA ", "SEMANA "):
+        if su.upper().startswith(prefix.upper()):
+            suffix = su[len(prefix):].strip()
+            candidate = f"Bloques {suffix}"
+            if candidate in sheets:
+                return candidate
+            # Try case-insensitive match
+            candidate_up = candidate.upper()
+            for s in sheets:
+                if s.upper() == candidate_up:
+                    return s
+            break
+    # Fallback: any sheet starting with "Bloques" (not "Resumen Bloques")
+    for s in sheets:
+        su2 = s.strip().upper()
+        if su2.startswith("BLOQUES") and su2 != "RESUMEN BLOQUES":
+            return s
+    return None
+
+def _detect_semana(sheet_name: str, parrilla_bytes: bytes | None, selected_sheet: str) -> str:
+    """
+    Auto-detect semana number. Priority:
+    1. S+digits anywhere in the sheet name (e.g. "AGENDA S26 Sant Joan" → "S26")
+    2. SEMANA column value from first data row
+    3. Fallback to "S??"
+    """
+    import re as _re
+    m = _re.search(r'\bS?(\d{2})\b', sheet_name, _re.IGNORECASE)
+    if m:
+        n = m.group(1)
+        # Avoid matching year-like numbers (2024, 2025...)
+        if int(n) <= 53:
+            return f"S{n}"
+    # Try reading SEMANA column from data
+    if parrilla_bytes and selected_sheet:
+        try:
+            import io
+            from openpyxl import load_workbook as _lwb
+            _wb = _lwb(io.BytesIO(parrilla_bytes), read_only=True)
+            if selected_sheet in _wb.sheetnames:
+                _ws = _wb[selected_sheet]
+                rows_iter = _ws.iter_rows(values_only=True)
+                hdr = next(rows_iter, ())
+                col_map = {str(h or "").strip().upper(): i for i, h in enumerate(hdr) if h}
+                sem_idx = col_map.get("SEMANA")
+                if sem_idx is not None:
+                    for data_row in rows_iter:
+                        val = data_row[sem_idx] if sem_idx < len(data_row) else None
+                        if val is not None:
+                            try:
+                                n = int(float(str(val)))
+                                if 1 <= n <= 53:
+                                    return f"S{n:02d}"
+                            except (ValueError, TypeError):
+                                pass
+                        break  # only need first data row
+        except Exception:
+            pass
+    return "S??"
+
+
 # ── Validation panel ──────────────────────────────────────────────────────────
-def _run_validation(parrilla_bytes, gd_bytes=None):
+def _run_validation(parrilla_bytes, gd_bytes=None, sheet_name=None):
     """Run validate_parrilla.validate() safely; return issues list."""
     try:
         sys.path.insert(0, str(BASE_DIR))
         from validate_parrilla import validate
-        return validate(parrilla_bytes, gd_bytes)
+        return validate(parrilla_bytes, gd_bytes, sheet_name=sheet_name)
     except Exception as e:
         return [{"severity": "warning", "category": "estructura",
                  "title": "No se pudo ejecutar la validación previa",
                  "detail": str(e), "items": [], "autocorrected": False}]
 
-def render_validation(parrilla_file, gd_file=None):
+def render_validation(parrilla_file, gd_file=None, sheet_name=None):
     """
     Run validation and render the results panel in Streamlit.
     Always returns True (never blocks generation).
@@ -27,7 +115,7 @@ def render_validation(parrilla_file, gd_file=None):
     if gd_file:
         gd_bytes = gd_file.read(); gd_file.seek(0)
 
-    issues = _run_validation(par_bytes, gd_bytes)
+    issues = _run_validation(par_bytes, gd_bytes, sheet_name=sheet_name)
 
     # Count severities
     counts = {"error": 0, "warning": 0, "info": 0, "ok": 0}
@@ -76,7 +164,7 @@ def render_validation(parrilla_file, gd_file=None):
 
     return True  # never blocks
 
-def _render_output_validation(parrilla_file, gd_output_bytes: bytes):
+def _render_output_validation(parrilla_file, gd_output_bytes: bytes, sheet_name=None):
     """
     Post-generation validation: cross-check the produced GD against the parrilla.
     Shows results in an expander. Never blocks.
@@ -85,7 +173,7 @@ def _render_output_validation(parrilla_file, gd_output_bytes: bytes):
         sys.path.insert(0, str(BASE_DIR))
         from validate_parrilla import validate_output, summary
         par_bytes = parrilla_file.read(); parrilla_file.seek(0)
-        issues = validate_output(par_bytes, gd_output_bytes)
+        issues = validate_output(par_bytes, gd_output_bytes, sheet_name=sheet_name)
     except Exception as e:
         st.warning(f"⚠️ No se pudo ejecutar la validación del resultado: {e}")
         return
@@ -171,49 +259,84 @@ st.markdown("### Ficheros de entrada")
 col1, col2 = st.columns(2)
 with col1:
     f_parrilla = st.file_uploader("Parrilla de salidas", type=["xlsx"],
-                                   help="Debe incluir la hoja Resumen Bloques")
+                                   help="Debe incluir la hoja con TIPO_SALIDA y Resumen Bloques")
 
     # Dynamic sheet selector: read sheets from uploaded file
+    _embedded_bloques_sheet = None  # will be set below if detected
     if f_parrilla:
         import io as _io2
         from openpyxl import load_workbook as _lwb2
-        _wb_tmp = _lwb2(_io2.BytesIO(f_parrilla.read()), read_only=True)
+        _par_bytes_tmp = f_parrilla.read()
         f_parrilla.seek(0)
-        # Filter to relevant sheets: those with TIPO_SALIDA column (parrilla sheets)
+        _wb_tmp = _lwb2(_io2.BytesIO(_par_bytes_tmp), read_only=True)
         _all_sheets = _wb_tmp.sheetnames
-        _valid = []
+
+        # Filter to event sheets only (exclude base B2B, B2C, Bloques*, etc.)
+        _agenda_first = []  # AGENDA/SEMANA sheets (highest priority)
+        _other_event  = []  # other event sheets
+
         for _sh in _all_sheets:
             _ws_tmp = _wb_tmp[_sh]
-            _first = next(_ws_tmp.iter_rows(values_only=True, max_row=1), None)
-            if _first and any(str(h or "").strip().upper() in ("PLAYA","TIPO_SALIDA","DIA_PLAYA_NEW")
-                              for h in _first):
-                _valid.append(_sh)
+            _first  = next(_ws_tmp.iter_rows(values_only=True, max_row=1), None)
+            if _first is None:
+                continue
+            if not _is_event_sheet(_sh, _first):
+                continue
+            _sh_up = _sh.strip().upper()
+            if _sh_up.startswith("AGENDA") or _sh_up.startswith("SEMANA SANTA") or _sh_up.startswith("SEMANA "):
+                _agenda_first.append(_sh)
+            else:
+                _other_event.append(_sh)
+
+        _valid = _agenda_first + _other_event
+
+        # Fallback: if no event sheet found, show all with TIPO_SALIDA
+        if not _valid:
+            for _sh in _all_sheets:
+                _ws_tmp = _wb_tmp[_sh]
+                _first  = next(_ws_tmp.iter_rows(values_only=True, max_row=1), None)
+                if _first and any(str(h or "").strip().upper() == "TIPO_SALIDA" for h in _first):
+                    _valid.append(_sh)
+
         _options = _valid if _valid else _all_sheets
-        # Pick best default: prefer parrilla_test_* sheets
-        _default_idx = next(
-            (i for i, s in enumerate(_options) if s.lower().startswith("parrilla_test")), 0
-        )
+        _default_idx = 0  # Best candidate is first (AGENDA sheets are first)
+
         sheet = st.selectbox("Hoja de parrilla", options=_options, index=_default_idx,
-                             help="Selecciona la pestaña con los datos de la semana")
+                             help="Selecciona la pestaña con los datos del evento especial (AGENDA...)")
+
+        # Detect embedded bloques sheet for the selected event
+        _embedded_bloques_sheet = _detect_bloques_sheet(_wb_tmp, sheet)
     else:
-        sheet = st.text_input("Nombre de hoja", value="parrilla_test_s14",
+        sheet = st.text_input("Nombre de hoja", value="AGENDA S26 Sant Joan",
                               help="Sube la parrilla para ver las hojas disponibles")
 
-    # Auto-detect semana from sheet name (parrilla_test_s18 → S18)
-    import re as _re_sh
-    _m_sem = _re_sh.search(r's([0-9]+)', sheet.lower())
-    _sem_default = f"S{_m_sem.group(1).upper()}" if _m_sem else "S14"
+    # Auto-detect semana
+    _par_bytes_for_sem = f_parrilla.read() if f_parrilla else None
+    if f_parrilla: f_parrilla.seek(0)
+    _sem_default = _detect_semana(sheet, _par_bytes_for_sem, sheet if f_parrilla else "")
     semana = st.text_input("Semana", value=_sem_default,
-                           help="Se autodetecta del nombre de hoja")
+                           help="Se autodetecta del nombre de hoja o de la columna SEMANA")
+
 with col2:
     f_gd  = st.file_uploader("GRUPO_DESTINOS", type=["xlsx"],
                                help="Export DXC o fichero clásico")
     f_cap = st.file_uploader("Capacidad de rampas", type=["csv"],
                                help="CSV con columnas RAMP;PALLETS")
 
-f_bloques = st.file_uploader(
-    "Bloques horarios *(necesario para Gantt y Sorter Map)*", type=["xlsx"],
-    help="Columnas: NUEVO BLOQUE · Día LIBERACIÓN · Hora LIBERACIÓN · Día DESACTIVACIÓN · Hora DESACTIVACIÓN")
+# Bloques horarios: optional if embedded in parrilla, required otherwise
+_bloques_help = "Columnas: NUEVO BLOQUE · Día LIBERACIÓN · Hora LIBERACIÓN · Día DESACTIVACIÓN · Hora DESACTIVACIÓN"
+if _embedded_bloques_sheet:
+    _bloques_caption = f"ℹ️ Se usará la hoja **{_embedded_bloques_sheet}** de la parrilla automáticamente. Sube otro fichero solo si quieres sobreescribir."
+    f_bloques = st.file_uploader(
+        f"Bloques horarios *(detectado: {_embedded_bloques_sheet} en parrilla)*",
+        type=["xlsx"],
+        help=_bloques_help)
+    if f_bloques is None:
+        st.caption(_bloques_caption)
+else:
+    f_bloques = st.file_uploader(
+        "Bloques horarios *(necesario para Gantt y Sorter Map)*", type=["xlsx"],
+        help=_bloques_help)
 
 f_superplaya = st.file_uploader(
     "Superplayas *(opcional — mejora la agrupación de rampas)*", type=["xlsx"],
@@ -224,29 +347,70 @@ st.divider()
 # ── Helpers ───────────────────────────────────────────────────────────────────
 ALL_DAYS = ["DOMINGO","LUNES","MARTES","MIERCOLES","JUEVES","VIERNES","SABADO"]
 
-# Block letter → day name mapping (for filter display)
 BLOQUE_LETRA_DAY = {
     "D": "DOMINGO",  "L": "LUNES",  "M": "MARTES",
     "X": "MIERCOLES", "J": "JUEVES", "V": "VIERNES", "S": "SABADO"
 }
-# Ordered block families for the multiselect
 BLOQUE_OPTIONS = ["D (Domingo)","L (Lunes)","M (Martes)",
                   "X (Miercoles)","J (Jueves)","V (Viernes)","S (Sabado)"]
 
 def save_uploads(tmp: Path):
     p = {}
-    for key, f, name in [
-        ("parrilla",    f_parrilla,    "parrilla.xlsx"),
-        ("gd",          f_gd,          "gd.xlsx"),
-        ("cap",         f_cap,          "cap.csv"),
-        ("bloques",     f_bloques,      "bloques.xlsx"),
-        ("superplaya",  f_superplaya,   "superplaya.xlsx"),
-    ]:
-        if f:
-            path = tmp / name
-            path.write_bytes(f.read())
-            f.seek(0)
-            p[key] = path
+
+    # Parrilla
+    if f_parrilla:
+        path = tmp / "parrilla.xlsx"
+        path.write_bytes(f_parrilla.read())
+        f_parrilla.seek(0)
+        p["parrilla"] = path
+
+    # GD
+    if f_gd:
+        path = tmp / "gd.xlsx"
+        path.write_bytes(f_gd.read())
+        f_gd.seek(0)
+        p["gd"] = path
+
+    # Cap
+    if f_cap:
+        path = tmp / "cap.csv"
+        path.write_bytes(f_cap.read())
+        f_cap.seek(0)
+        p["cap"] = path
+
+    # Bloques: explicit upload overrides embedded sheet
+    if f_bloques:
+        path = tmp / "bloques.xlsx"
+        path.write_bytes(f_bloques.read())
+        f_bloques.seek(0)
+        p["bloques"] = path
+    elif _embedded_bloques_sheet and "parrilla" in p:
+        # Extract the embedded Bloques sheet from the parrilla file
+        try:
+            import io as _io_bl
+            import openpyxl as _opx_bl
+            _wb_bl = _opx_bl.load_workbook(str(p["parrilla"]), read_only=True)
+            if _embedded_bloques_sheet in _wb_bl.sheetnames:
+                # Write a new xlsx with only the Bloques sheet
+                _wb_out = _opx_bl.Workbook()
+                _ws_src = _wb_bl[_embedded_bloques_sheet]
+                _ws_dst = _wb_out.active
+                _ws_dst.title = _embedded_bloques_sheet
+                for row in _ws_src.iter_rows(values_only=True):
+                    _ws_dst.append([c for c in row])
+                path_bl = tmp / "bloques.xlsx"
+                _wb_out.save(str(path_bl))
+                p["bloques"] = path_bl
+        except Exception as _bl_err:
+            pass  # If extraction fails, proceed without bloques
+
+    # Superplaya
+    if f_superplaya:
+        path = tmp / "superplaya.xlsx"
+        path.write_bytes(f_superplaya.read())
+        f_superplaya.seek(0)
+        p["superplaya"] = path
+
     return p
 
 def run_gd(p, tmp, sc, days_arg=""):
@@ -276,10 +440,13 @@ XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 # ── Action buttons — new flow: Sort Map first, then GD ───────────────────────
 st.markdown("### Acciones")
 
-base_ok   = bool(f_parrilla and f_gd and f_cap)
-vis_ok    = bool(base_ok and f_bloques)
-sortmap_done = bool(st.session_state.get("r3_map"))  # GD only available after sort map
-gd_ok     = bool(sortmap_done and base_ok)             # GD requires sort map first
+# bloques available = either uploaded or embedded in parrilla
+_bloques_available = bool(f_bloques or _embedded_bloques_sheet)
+
+base_ok      = bool(f_parrilla and f_gd and f_cap)
+vis_ok       = bool(base_ok and _bloques_available)
+sortmap_done = bool(st.session_state.get("r3_map"))
+gd_ok        = bool(sortmap_done and base_ok)
 
 b1, b2, b3 = st.columns(3)
 with b1:
@@ -288,10 +455,13 @@ with b1:
     if st.button("🗺 Generar", key="go3", type="primary",
                  disabled=not vis_ok, use_container_width=True):
         st.session_state["r3_map"] = None
-        st.session_state["r3_gd_bytes"] = None  # clear cached GD for sort map
+        st.session_state["r3_gd_bytes"] = None
         st.session_state["_run3"] = True
     if not vis_ok:
-        st.caption("_Sube parrilla, GD, capacidad y bloques_")
+        if not base_ok:
+            st.caption("_Sube parrilla, GD y capacidad_")
+        else:
+            st.caption("_Requiere bloques horarios_")
 
 with b2:
     st.markdown("**2 · Configuración DXC**")
@@ -315,7 +485,10 @@ with b3:
         st.session_state["r2_gantt"] = None
         st.session_state["_run2"] = True
     if not vis_ok:
-        st.caption("_Requiere también bloques horarios_")
+        if not base_ok:
+            st.caption("_Sube parrilla, GD y capacidad_")
+        else:
+            st.caption("_Requiere bloques horarios_")
 
 st.divider()
 
@@ -323,12 +496,10 @@ st.divider()
 if st.session_state.get("_run1"):
     st.session_state["_run1"] = False
     sc = semana.strip() or sheet.strip().upper()
-    # Validation (always runs, never blocks)
-    render_validation(f_parrilla, f_gd)
+    render_validation(f_parrilla, f_gd, sheet_name=sheet.strip())
     with tempfile.TemporaryDirectory() as _tmp:
         tmp = Path(_tmp)
         p   = save_uploads(tmp)
-        # Reuse GD from sort map step if available — avoids regenerating
         _r3_gd = st.session_state.get("r3_gd_bytes")
         if _r3_gd:
             gd = tmp / f"GRUPO_DESTINOS_{sc}.xlsx"
@@ -361,15 +532,14 @@ if st.session_state.get("_run1"):
                 st.session_state["r1_esp_sorexp_csv"] = (esp_path.stem + "_SOREXP.csv", _esx)
             st.session_state["r1_can"]   = (can_path.name, can_path.read_text(encoding='utf-8')) if can_path.exists() else None
             st.session_state["r1_html"]  = (html.name,  html.read_bytes()) if html.exists() else None
-            st.session_state["r1_day_filter"] = None  # full run, no day filter
-            # ── Post-generation sort map validation ──
-            _render_output_validation(f_parrilla, _gd_bytes)
+            st.session_state["r1_day_filter"] = None
+            _render_output_validation(f_parrilla, _gd_bytes, sheet_name=sheet.strip())
 
 # ── Execute action 2 ──────────────────────────────────────────────────────────
 if st.session_state.get("_run2"):
     st.session_state["_run2"] = False
     sc = semana.strip() or sheet.strip().upper()
-    render_validation(f_parrilla, f_gd)
+    render_validation(f_parrilla, f_gd, sheet_name=sheet.strip())
     with tempfile.TemporaryDirectory() as _tmp:
         tmp = Path(_tmp)
         p   = save_uploads(tmp)
@@ -395,11 +565,10 @@ if st.session_state.get("_run2"):
 if st.session_state.get("_run3"):
     st.session_state["_run3"] = False
     sc = semana.strip() or sheet.strip().upper()
-    render_validation(f_parrilla, f_gd)
+    render_validation(f_parrilla, f_gd, sheet_name=sheet.strip())
     with tempfile.TemporaryDirectory() as _tmp:
         tmp = Path(_tmp)
         p   = save_uploads(tmp)
-        # Use filtered GD if available, else generate full GD
         _filtered_bytes = st.session_state.get("r1_gd_filtered_bytes")
         _filter_days    = st.session_state.get("r1_day_filter")
         if _filtered_bytes:
@@ -415,7 +584,6 @@ if st.session_state.get("_run3"):
                 st.error("Error generando GD base.")
                 show_log(r0, expanded=True)
         if r0_ok:
-            # Save GD bytes so action 1 can reuse without regenerating
             st.session_state["r3_gd_bytes"] = gd.read_bytes()
             out = tmp / f"sorter_map_{sc}.xlsx"
             with st.spinner("Generando Sorter Map…"):
@@ -438,7 +606,6 @@ if st.session_state["r1_gd"] is not None:
     sc = semana.strip() or sheet.strip().upper()
     st.success(f"✓ Configuración {sc} generada")
 
-    # ── Day filter for filtered re-extraction ──
     with st.expander("🔍 Filtrar por bloque y regenerar especiales"):
         selected_bloques = st.multiselect(
             "Bloques a incluir en el GD filtrado",
@@ -448,8 +615,7 @@ if st.session_state["r1_gd"] is not None:
             placeholder="Selecciona bloques…",
             help="Cada letra = familia de bloques activos ese día (D=Dom, L=Lun, M=Mar, X=Mie, J=Jue, V=Vie, S=Sab)",
         )
-        # Pass block letters directly to process_parrilla (it now filters by bloque letter)
-        selected_days = [b.split()[0] for b in selected_bloques]  # just the letters: M, X, L...
+        selected_days = [b.split()[0] for b in selected_bloques]
         if st.button("⚙️ Regenerar con filtro", key="regen_filter",
                      disabled=not (selected_bloques and f_parrilla and f_gd and f_cap)):
             days_arg = ",".join(selected_days)
@@ -462,13 +628,11 @@ if st.session_state["r1_gd"] is not None:
                     esp_path = Path(str(gd).replace('.xlsx','_SOLO_ESPECIALES.xlsx'))
                     can_path = Path(str(gd).replace('.xlsx','_CANCELADAS.txt'))
                     _gd_bytes_f = gd.read_bytes()
-                    # Add day suffix to filenames so downloads are distinct from full run
                     _day_suffix = "_" + "+".join(b.split()[0] for b in selected_bloques)
-                    _gd_name_f   = gd.stem + _day_suffix + ".xlsx"
-                    _esp_name_f  = esp_path.stem + _day_suffix + ".xlsx" if esp_path.exists() else None
-                    st.session_state["r1_gd"]   = (_gd_name_f, _gd_bytes_f)
-                    st.session_state["r1_esp"]  = (_esp_name_f, esp_path.read_bytes()) if esp_path.exists() else None
-                    # Regenerate DXC CSVs from filtered GD
+                    _gd_name_f  = gd.stem + _day_suffix + ".xlsx"
+                    _esp_name_f = esp_path.stem + _day_suffix + ".xlsx" if esp_path.exists() else None
+                    st.session_state["r1_gd"]  = (_gd_name_f, _gd_bytes_f)
+                    st.session_state["r1_esp"] = (_esp_name_f, esp_path.read_bytes()) if esp_path.exists() else None
                     _px_f, _sx_f = gd_to_dxc_csv(_gd_bytes_f)
                     st.session_state["r1_postex_csv"] = (gd.stem + _day_suffix + "_POSTEX.csv", _px_f)
                     st.session_state["r1_sorexp_csv"] = (gd.stem + _day_suffix + "_SOREXP.csv", _sx_f)
@@ -484,13 +648,10 @@ if st.session_state["r1_gd"] is not None:
                     st.error("Error en regeneración.")
                     show_log(r, expanded=True)
 
-    # Day filter badge
     if st.session_state["r1_day_filter"]:
-        # Show block letters instead of day names
         _labels = [f"Bloque {l}" for l in st.session_state['r1_day_filter']]
         st.info(f"Filtrado a: {', '.join(_labels)}")
 
-    # Downloads row 1: GD completo + solo especiales
     c1, c2 = st.columns(2)
     with c1:
         name, data = st.session_state["r1_gd"]
@@ -504,7 +665,6 @@ if st.session_state["r1_gd"] is not None:
                                mime=XLSX_MIME, use_container_width=True)
             st.caption("Solo filas nuevas a añadir en DXC")
 
-    # CSV DXC format downloads
     st.markdown("**Formato CSV para importar en DXC:**")
     c5, c6, c7, c8 = st.columns(4)
     with c5:
@@ -528,7 +688,6 @@ if st.session_state["r1_gd"] is not None:
             st.download_button("⬇️ SOREXP especiales", data=data, file_name=name,
                                mime="text/csv", use_container_width=True)
 
-    # Downloads row 2: canceladas + resumen HTML
     c3, c4 = st.columns(2)
     with c3:
         if st.session_state["r1_can"]:
@@ -562,4 +721,4 @@ if st.session_state["r3_map"] is not None:
     st.caption("Hojas: DOM · LUN · MAR · MIÉ · JUE · VIE · SÁB · LEYENDA")
 
 st.divider()
-st.caption("v0.07 · VDL B2B · Estrictamente confidencial")
+st.caption("v0.09 · VDL B2B · Estrictamente confidencial")
