@@ -1,4 +1,4 @@
-# Version: 0.10
+# Version: 0.09
 import streamlit as st
 import subprocess, sys, tempfile, datetime as dt
 from pathlib import Path
@@ -416,11 +416,15 @@ def save_uploads(tmp: Path):
         f_bloques.seek(0)
         p["bloques"] = path
     elif _embedded_bloques_sheet and "parrilla" in p:
-        # Extract the embedded Bloques sheet from the parrilla file
+        # Extract the embedded Bloques sheet from the parrilla file.
+        # data_only=True is essential: the Bloques sheet's timing columns
+        # (LIBERACION, DESACTIVACION...) are formulas (VLOOKUP to Resumen Bloques).
+        # Without it we'd copy "=VLOOKUP(...)" as text and the sorter map would
+        # lose those block timings, silently dropping especiales (e.g. L6 blocks).
         try:
             import io as _io_bl
             import openpyxl as _opx_bl
-            _wb_bl = _opx_bl.load_workbook(str(p["parrilla"]), read_only=True)
+            _wb_bl = _opx_bl.load_workbook(str(p["parrilla"]), read_only=True, data_only=True)
             if _embedded_bloques_sheet in _wb_bl.sheetnames:
                 # Write a new xlsx with only the Bloques sheet
                 _wb_out = _opx_bl.Workbook()
@@ -752,4 +756,4 @@ if st.session_state["r3_map"] is not None:
     st.caption("Hojas: DOM · LUN · MAR · MIÉ · JUE · VIE · SÁB · LEYENDA")
 
 st.divider()
-st.caption("v0.10 · VDL B2B · Estrictamente confidencial")
+st.caption("v0.09 · VDL B2B · Estrictamente confidencial")
