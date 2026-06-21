@@ -1540,7 +1540,8 @@ def main():
         try:
             import re as _re_ss
             from openpyxl import load_workbook as _lwb_e2
-            _wb_e2 = _lwb_e2(_par_path, read_only=True)
+            _wb_e2 = _lwb_e2(_par_path, read_only=True, data_only=True)
+            _par_sheet_arg = _sys.argv[7] if len(_sys.argv) > 7 else None
 
             def _extract_playa_ss(dpn, dpo):
                 """Extract playa name from DIA_PLAYA_NEW or DIA_PLAYA_ORIGINAL."""
@@ -1562,14 +1563,29 @@ def main():
                     str(s), _re_ss.IGNORECASE)
                 return _m.group(1).upper() if _m else str(s).strip().upper()
 
-            # Find sheet with TIPO_SALIDA (works for SS sheet and unified Hoja1)
+            # Pick the parrilla sheet: prefer the one passed by the app (argv[7]),
+            # else the SEMANA SANTA / AGENDA sheet, else any sheet with TIPO_SALIDA
+            # that is not a base sheet (B2B, B2C...).
+            _BASE_SH = {'B2B','B2C','BLOQUES','RESUMEN BLOQUES','VOLUMENES','APY'}
             _data_sheet = None
-            for _sh in _wb_e2.sheetnames:
-                _hdr_tmp = next(_wb_e2[_sh].iter_rows(values_only=True, max_row=1), ())
+            if _par_sheet_arg and _par_sheet_arg in _wb_e2.sheetnames:
+                _hdr_tmp = next(_wb_e2[_par_sheet_arg].iter_rows(values_only=True, max_row=1), ())
                 if any(str(_h or '').strip().upper() == 'TIPO_SALIDA' for _h in _hdr_tmp):
-                    _data_sheet = _sh
-                    # Prefer SEMANA SANTA sheet if present
-                    if 'SEMANA' in _sh.upper() or 'SANTA' in _sh.upper():
+                    _data_sheet = _par_sheet_arg
+            if not _data_sheet:
+                for _sh in _wb_e2.sheetnames:
+                    if _sh.strip().upper() in _BASE_SH or _sh.strip().upper().startswith('BLOQUES'):
+                        continue
+                    _hdr_tmp = next(_wb_e2[_sh].iter_rows(values_only=True, max_row=1), ())
+                    if any(str(_h or '').strip().upper() == 'TIPO_SALIDA' for _h in _hdr_tmp):
+                        _data_sheet = _sh
+                        if 'SEMANA' in _sh.upper() or 'SANTA' in _sh.upper() or 'AGENDA' in _sh.upper():
+                            break
+            if not _data_sheet:
+                for _sh in _wb_e2.sheetnames:
+                    _hdr_tmp = next(_wb_e2[_sh].iter_rows(values_only=True, max_row=1), ())
+                    if any(str(_h or '').strip().upper() == 'TIPO_SALIDA' for _h in _hdr_tmp):
+                        _data_sheet = _sh
                         break
 
             if _data_sheet:
@@ -1587,24 +1603,37 @@ def main():
                     _tipo    = _g('TIPO_SALIDA').upper()
                     _dpn     = _g('DIA_PLAYA_NEW')
                     _dpo     = _g('DIA_PLAYA_ORIGINAL')
-                    _dia_new = _g('DIA_SALIDA_NEW').upper() or _extract_day(_dpn)
-                    _dia_ori = _g('DIA_SALIDA_ORIGINAL').upper() or _extract_day(_dpo)
+                    # New unified format (S26+): only DIA_PLAYA exists; the new day
+                    # comes from TURNO_REPARTO's first letter.
+                    _dpl     = _g('DIA_PLAYA')
+                    _turno   = _g('TURNO_REPARTO')
+                    _LETRA_DIA = {'D':'DOMINGO','L':'LUNES','M':'MARTES','X':'MIERCOLES',
+                                  'J':'JUEVES','V':'VIERNES','S':'SABADO'}
+                    _dia_new = (_g('DIA_SALIDA_NEW').upper()
+                                or (_LETRA_DIA.get(_turno[:1].upper(), '') if _turno else '')
+                                or _extract_day(_dpn))
+                    _dia_ori = (_g('DIA_SALIDA_ORIGINAL').upper()
+                                or _extract_day(_dpo)
+                                or _g('DIA_SALIDA').upper()
+                                or _extract_day(_dpl))
                     _bloque  = _g('BLOQUE')
                     _zona    = _g('ZONA').upper()
 
-                    # For especiales: playa from DIA_PLAYA_ORIGINAL (authoritative)
-                    if 'ESPECIAL DIA CAMBIO' in _tipo:
-                        _playa = _extract_playa_ss(_dpo, _dpn)
+                    # Playa: for especiales prefer DIA_PLAYA_ORIGINAL, then DIA_PLAYA_NEW,
+                    # then DIA_PLAYA (new format).
+                    _is_esp_dia = ('ESPECIAL' in _tipo and 'DIA' in _tipo)
+                    if _is_esp_dia and _dpo:
+                        _playa = _extract_playa_ss(_dpo, _dpn) or _extract_playa_ss(_dpl, '')
                     else:
-                        _playa = _extract_playa_ss(_dpn, _dpo)
+                        _playa = _extract_playa_ss(_dpn, _dpo) or _extract_playa_ss(_dpl, '')
                     if not _playa: continue
 
-                    if _tipo == 'CANCELADA':
+                    if _tipo.startswith('CANCELADA'):
                         _cancelled_esp.add(_playa.upper())
                         if _dia_ori:
                             _canceladas_por_dia[_dia_ori].append(_playa)
 
-                    elif 'ESPECIAL DIA CAMBIO' in _tipo:
+                    elif _is_esp_dia:
                         # E2: known routes OR (zona=E2 AND GD confirms no sorter elements)
                         # If GD has real sorter elements, treat as sorter regardless of parrilla zona
                         _gd_is_sorter = _playa_has_sorter.get(_playa.upper())
@@ -1612,8 +1641,11 @@ def main():
                                   or 'E2' in _tipo or 'MANUAL' in _tipo
                                   or (_zona == 'E2' and _gd_is_sorter is not True))
                         if _is_e2:
-                            if _dia_ori:
-                                _e2_by_day[_dia_ori].append((_playa, _bloque))
+                            # E2/manual especial: show as especial WITHOUT positions,
+                            # on the NEW day (where it now runs).
+                            _e2_day = _dia_new or _dia_ori
+                            if _e2_day:
+                                _e2_by_day[_e2_day].append((_playa, _bloque))
                         else:
                             if _dia_ori and _dia_new and _dia_ori != _dia_new:
                                 _especiales_por_dia_orig[_dia_ori].append(
