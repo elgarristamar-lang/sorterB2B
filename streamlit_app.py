@@ -1,4 +1,4 @@
-# Version: 0.09
+# Version: 0.10
 import streamlit as st
 import subprocess, sys, tempfile, datetime as dt
 from pathlib import Path
@@ -27,29 +27,60 @@ def _is_event_sheet(sheet_name: str, headers: tuple) -> bool:
 def _detect_bloques_sheet(wb, event_sheet: str) -> str | None:
     """
     Find the matching Bloques sheet for a given event sheet.
-    Tries: 'Bloques ' + event suffix, then any sheet starting with 'Bloques'.
+
+    Strategy (in order):
+      1. Exact suffix: 'Bloques ' + everything after AGENDA/SEMANA prefix
+      2. Week-code match: if the event sheet contains a week code like 'S26',
+         pick the Bloques sheet that contains the same code ('Bloques S26').
+         This is critical because the parrilla has several Bloques sheets
+         (Bloques, Bloques 25 de MAYO, Bloques S26) and the generic 'Bloques'
+         must NOT be picked for an S26 event.
+      3. Generic fallback: any 'Bloques*' sheet, but only the plain base
+         'Bloques' as a last resort.
     """
+    import re as _re
     sheets = wb.sheetnames
-    # Derive suffix: "AGENDA S26 Sant Joan" → "S26 Sant Joan"
     su = event_sheet.strip()
+
+    # 1. Exact suffix match
     for prefix in ("AGENDA ", "SEMANA SANTA ", "SEMANA "):
         if su.upper().startswith(prefix.upper()):
             suffix = su[len(prefix):].strip()
             candidate = f"Bloques {suffix}"
             if candidate in sheets:
                 return candidate
-            # Try case-insensitive match
             candidate_up = candidate.upper()
             for s in sheets:
                 if s.upper() == candidate_up:
                     return s
             break
-    # Fallback: any sheet starting with "Bloques" (not "Resumen Bloques")
+
+    # 2. Week-code match: extract S<NN> from the event sheet name
+    _m = _re.search(r'\bS(\d{1,2})\b', su, _re.IGNORECASE)
+    if _m:
+        code = f"S{_m.group(1)}"
+        code_up = code.upper()
+        for s in sheets:
+            su2 = s.strip().upper()
+            if su2.startswith("BLOQUES") and su2 != "RESUMEN BLOQUES":
+                # match the same week code as a whole token
+                if _re.search(r'\bS' + _m.group(1) + r'\b', s, _re.IGNORECASE):
+                    return s
+
+    # 3. Last resort: a Bloques* sheet, but prefer one that is NOT the plain
+    #    base 'Bloques' (which carries the normal-week timings).
+    _specific = None
+    _generic  = None
     for s in sheets:
         su2 = s.strip().upper()
-        if su2.startswith("BLOQUES") and su2 != "RESUMEN BLOQUES":
-            return s
-    return None
+        if su2 == "RESUMEN BLOQUES":
+            continue
+        if su2 == "BLOQUES":
+            _generic = s
+        elif su2.startswith("BLOQUES"):
+            if _specific is None:
+                _specific = s
+    return _specific or _generic
 
 def _detect_semana(sheet_name: str, parrilla_bytes: bytes | None, selected_sheet: str) -> str:
     """
@@ -721,4 +752,4 @@ if st.session_state["r3_map"] is not None:
     st.caption("Hojas: DOM · LUN · MAR · MIÉ · JUE · VIE · SÁB · LEYENDA")
 
 st.divider()
-st.caption("v0.09 · VDL B2B · Estrictamente confidencial")
+st.caption("v0.10 · VDL B2B · Estrictamente confidencial")
