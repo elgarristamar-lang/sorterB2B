@@ -1,10 +1,18 @@
-# validate_parrilla.py — Version 0.01
+# validate_parrilla.py — Version 0.02
 # Validación de parrilla + GD antes de generar.
 # Devuelve una lista de issues estructurados; no bloquea la generación.
 #
+# Cambios v0.02:
+#   - Acepta parámetro sheet_name para usar la hoja seleccionada por el usuario
+#   - Reconoce columna DIA_PLAYA (formato nuevo, equivalente a DIA_PLAYA_NEW)
+#   - Mapea nuevos tipos: ESPECIAL DIA, ESPECIAL DIA+CUTOFF, ESPECIAL DIA + CUTOFF
+#   - Mapea CANCELADA (MOVIDO...) como cancelada, BI SEMANAL como regular
+#   - Deriva dia_new desde TURNO_REPARTO cuando no hay DIA_SALIDA_NEW
+#   - Pasa sheet_name a validate_output y validate_zona_consistency
+#
 # Uso:
 #   from validate_parrilla import validate
-#   issues = validate(parrilla_bytes, gd_bytes)
+#   issues = validate(parrilla_bytes, gd_bytes, sheet_name="AGENDA S26 Sant Joan")
 
 from __future__ import annotations
 import io
@@ -41,10 +49,20 @@ _BLOQUE_RE = re.compile(r"^(\d+BLO[A-Z]\d+)_(.+)$")
 _SORTER_RE = re.compile(r"^R\d+")
 _E2_RE     = re.compile(r"^(MAN|EXDOCK|DOCK)", re.IGNORECASE)
 
+# Letra de bloque → día de la semana (usado para derivar dia_new desde TURNO_REPARTO)
+_LETRA_DIA = {
+    "D": "DOMINGO", "L": "LUNES",    "M": "MARTES",
+    "X": "MIERCOLES", "J": "JUEVES", "V": "VIERNES", "S": "SABADO",
+}
+
+# Hojas base a excluir del selector de "hojas de evento"
+_BASE_SHEETS = {"B2B", "B2C", "BLOQUES", "RESUMEN BLOQUES", "VOLUMENES", "APY",
+                "RESUMEN BLOQUES", "BLOQUES S26", "BLOQUES 25 DE MAYO"}
+
 
 def _extract_playa(dpn_val: str) -> str:
     """
-    Extract playa name from DIA_PLAYA_NEW value.
+    Extract playa name from DIA_PLAYA / DIA_PLAYA_NEW value.
     Handles:
       - LUNES_ESPANA_GUARROMAN          → ESPANA_GUARROMAN
       - CANCELADA_ESPANA_LAS_PALMAS     → ESPANA_LAS_PALMAS
@@ -61,6 +79,19 @@ def _extract_playa(dpn_val: str) -> str:
     if m:
         return m.group(2).strip()
     return s
+
+
+def _derive_dia_new_from_turno(turno_val: str) -> str:
+    """
+    Derive the new expedition day from TURNO_REPARTO.
+    TURNO_REPARTO format: 'D4', 'L4', 'V4', 'M1', 'X3', 'J5', etc.
+    The first letter indicates the block day: D=DOMINGO, L=LUNES, M=MARTES, etc.
+    For complex values like 'L4-V5', uses the first letter only.
+    """
+    if not turno_val:
+        return ""
+    letra = turno_val.strip()[0].upper()
+    return _LETRA_DIA.get(letra, "")
 
 
 def _parse_gd_desc(desc: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
@@ -82,11 +113,13 @@ def _parse_gd_desc(desc: str) -> Tuple[Optional[str], Optional[str], Optional[st
 
 # ── Loaders (in-memory, no disk) ──────────────────────────────────────────────
 
-def _load_parrilla(xlsx_bytes: bytes) -> Dict:
+def _load_parrilla(xlsx_bytes: bytes, sheet_name: Optional[str] = None) -> Dict:
     """
     Returns dict with:
       sheets, col_issues, records, stats
     records: list of {playa, dia_orig, dia_new, tipo, dpn_raw}
+
+    sheet_name: if provided and valid, use that sheet; otherwise auto-detect.
     """
     from openpyxl import load_workbook
     wb = load_workbook(io.BytesIO(xlsx_bytes), read_only=True)
@@ -96,14 +129,35 @@ def _load_parrilla(xlsx_bytes: bytes) -> Dict:
     records = []
     stats = {"regular": 0, "cancelada": 0, "especial": 0, "irregular": 0, "other": 0}
 
-    # Find the best sheet: one that contains TIPO_SALIDA
+    # Determine which sheet to use
     target_sheet = None
-    for sh in sheets:
-        ws = wb[sh]
-        hdr = next(ws.iter_rows(values_only=True, max_row=1), ())
-        if any(str(h or "").strip().upper() == "TIPO_SALIDA" for h in hdr):
-            target_sheet = sh
-            break
+
+    # 1. If caller specifies a sheet, use it if it has TIPO_SALIDA
+    if sheet_name and sheet_name in sheets:
+        ws_probe = wb[sheet_name]
+        hdr_probe = next(ws_probe.iter_rows(values_only=True, max_row=1), ())
+        if any(str(h or "").strip().upper() == "TIPO_SALIDA" for h in hdr_probe):
+            target_sheet = sheet_name
+
+    # 2. Auto-detect: find first non-base sheet with TIPO_SALIDA
+    if not target_sheet:
+        for sh in sheets:
+            if sh.upper() in _BASE_SHEETS:
+                continue
+            ws = wb[sh]
+            hdr = next(ws.iter_rows(values_only=True, max_row=1), ())
+            if any(str(h or "").strip().upper() == "TIPO_SALIDA" for h in hdr):
+                target_sheet = sh
+                break
+
+    # 3. Fallback: any sheet with TIPO_SALIDA
+    if not target_sheet:
+        for sh in sheets:
+            ws = wb[sh]
+            hdr = next(ws.iter_rows(values_only=True, max_row=1), ())
+            if any(str(h or "").strip().upper() == "TIPO_SALIDA" for h in hdr):
+                target_sheet = sh
+                break
 
     if not target_sheet:
         col_issues.append(_issue(
@@ -116,34 +170,46 @@ def _load_parrilla(xlsx_bytes: bytes) -> Dict:
                 "target_sheet": None, "has_playa_col": False, "has_bloques_sheet": False,
                 "cancelado_masc": []}
 
+    # Warn if we used a different sheet than requested
+    if sheet_name and sheet_name != target_sheet:
+        col_issues.append(_issue(
+            "warning", "estructura",
+            f"Hoja '{sheet_name}' no encontrada o sin TIPO_SALIDA — usando '{target_sheet}'",
+            f"La hoja seleccionada no existe o no tiene la columna requerida. "
+            f"Se procesará '{target_sheet}'.",
+            autocorrected=True,
+        ))
+
     ws = wb[target_sheet]
     all_rows = list(ws.iter_rows(values_only=True))
     hdr = all_rows[0]
     col = {str(h or "").strip().upper(): i for i, h in enumerate(hdr) if h}
 
-    # Check PLAYA column
-    has_playa = "PLAYA" in col or "AGRUPACION_PLAYA" in col
-    has_dpn   = "DIA_PLAYA_NEW" in col
+    # ── Check PLAYA column ────────────────────────────────────────────────────
+    # Accepted: PLAYA, AGRUPACION_PLAYA (old format)
+    #           DIA_PLAYA, DIA_PLAYA_NEW (new/unified format — DIA_PLAYA is standard)
+    has_playa    = "PLAYA" in col or "AGRUPACION_PLAYA" in col
+    has_dpn      = "DIA_PLAYA_NEW" in col or "DIA_PLAYA" in col
 
-    if not has_playa:
-        if has_dpn:
-            col_issues.append(_issue(
-                "warning", "estructura",
-                "Columna PLAYA no encontrada — se usará DIA_PLAYA_NEW",
-                "Se esperaba columna PLAYA o AGRUPACION_PLAYA. "
-                "El nombre de playa se extraerá automáticamente del valor de DIA_PLAYA_NEW "
-                "(ej. LUNES_ESPANA_GUARROMAN → ESPANA_GUARROMAN).",
-                autocorrected=True,
-            ))
-        else:
-            col_issues.append(_issue(
-                "error", "estructura",
-                "No hay columna PLAYA ni DIA_PLAYA_NEW",
-                f"Columnas encontradas: {', '.join(col.keys())}. "
-                "No es posible identificar los destinos.",
-            ))
+    if not has_playa and not has_dpn:
+        col_issues.append(_issue(
+            "error", "estructura",
+            "No hay columna PLAYA, DIA_PLAYA ni DIA_PLAYA_NEW",
+            f"Columnas encontradas: {', '.join(col.keys())}. "
+            "No es posible identificar los destinos.",
+        ))
+    elif not has_playa and has_dpn:
+        # DIA_PLAYA is the new standard — treat as info, not warning
+        dpn_col = "DIA_PLAYA_NEW" if "DIA_PLAYA_NEW" in col else "DIA_PLAYA"
+        col_issues.append(_issue(
+            "info", "estructura",
+            f"Formato unificado: usando columna {dpn_col}",
+            f"La playa se extrae de {dpn_col} (ej. LUNES_ESPANA_GUARROMAN → ESPANA_GUARROMAN). "
+            "Comportamiento correcto para el formato nuevo de parrilla.",
+            autocorrected=True,
+        ))
 
-    # Check BLOQUE column
+    # ── Check BLOQUE column ───────────────────────────────────────────────────
     if "BLOQUE" not in col:
         col_issues.append(_issue(
             "warning", "estructura",
@@ -153,11 +219,10 @@ def _load_parrilla(xlsx_bytes: bytes) -> Dict:
             autocorrected=True,
         ))
 
-    # Check Resumen Bloques / bloques sheet
+    # ── Check Resumen Bloques / bloques sheet ─────────────────────────────────
     has_bloques_sheet = "Resumen Bloques" in sheets
     bloques_alt = None
     if not has_bloques_sheet:
-        # Look for any sheet with bloque/cluster columns
         for sh in sheets:
             if sh == target_sheet:
                 continue
@@ -169,9 +234,9 @@ def _load_parrilla(xlsx_bytes: bytes) -> Dict:
                 break
         if bloques_alt:
             col_issues.append(_issue(
-                "warning", "estructura",
-                f"No hay hoja 'Resumen Bloques' — se usará '{bloques_alt}'",
-                "Los timings horarios de bloques se leerán desde esta hoja alternativa. "
+                "info", "estructura",
+                f"Hoja 'Resumen Bloques' no encontrada — se usará '{bloques_alt}'",
+                "Los timings horarios de bloques se leerán desde esta hoja. "
                 "Comprueba que tiene las columnas correctas.",
                 autocorrected=True,
             ))
@@ -183,18 +248,18 @@ def _load_parrilla(xlsx_bytes: bytes) -> Dict:
                 "en la asignación de rampas.",
             ))
 
-    # S15 unified format (no SEMANA SANTA sheet needed) — no issue to report
-
-    # Parse records
-    tipo_idx = col.get("TIPO_SALIDA")
-    dpn_idx  = col.get("DIA_PLAYA_NEW") or col.get("DIA_PLAYA")
-    dpo_idx  = col.get("DIA_PLAYA_ORIGINAL")
-    dsn_idx  = col.get("DIA_SALIDA_NEW")
-    dso_idx  = col.get("DIA_SALIDA_ORIGINAL") or col.get("DIA_SALIDA")
-    playa_idx = col.get("PLAYA") or col.get("AGRUPACION_PLAYA")
+    # ── Parse records ─────────────────────────────────────────────────────────
+    tipo_idx   = col.get("TIPO_SALIDA")
+    # Columna de playa: DIA_PLAYA > DIA_PLAYA_NEW > (legacy) DIA_PLAYA_ORIGINAL
+    dpn_idx    = col.get("DIA_PLAYA") or col.get("DIA_PLAYA_NEW")
+    dpo_idx    = col.get("DIA_PLAYA_ORIGINAL")           # old format only
+    dsn_idx    = col.get("DIA_SALIDA_NEW")               # old format only
+    dso_idx    = col.get("DIA_SALIDA_ORIGINAL") or col.get("DIA_SALIDA")
+    playa_idx  = col.get("PLAYA") or col.get("AGRUPACION_PLAYA")
     bloque_idx = col.get("BLOQUE")
-    idc_idx  = col.get("ID_CLUSTER")
-    idcn_idx = col.get("ID_CLUSTER_NEW")
+    idc_idx    = col.get("ID_CLUSTER")
+    idcn_idx   = col.get("ID_CLUSTER_NEW")
+    turno_idx  = col.get("TURNO_REPARTO")                # new format — encodes dia_new
 
     cancelado_masc = []  # rows with CANCELADO_ (masculine) prefix
 
@@ -205,29 +270,28 @@ def _load_parrilla(xlsx_bytes: bytes) -> Dict:
             s = str(row[i]).strip()
             return "" if s.startswith("=") or s == "#N/A" else s
 
-        tipo   = g(tipo_idx).upper()
-        dpn    = g(dpn_idx)   # DIA_PLAYA_NEW  → día nuevo + playa
-        dpo    = g(dpo_idx)   # DIA_PLAYA_ORIGINAL → día original + playa
-        dia_new  = g(dsn_idx).upper()
+        tipo     = g(tipo_idx).upper().strip()
+        dpn      = g(dpn_idx)    # DIA_PLAYA or DIA_PLAYA_NEW → día+playa
+        dpo      = g(dpo_idx)    # DIA_PLAYA_ORIGINAL (old format)
+        dia_new  = g(dsn_idx).upper()   # DIA_SALIDA_NEW (old format)
         dia_orig = g(dso_idx).upper()
+        turno    = g(turno_idx)
 
-        # Extract playa name.
-        # For ESPECIAL DIA CAMBIO: use DIA_PLAYA_ORIGINAL as the authoritative source
-        # because the GD is keyed on the ORIGINAL day+playa, not the new one.
-        # CANCELADA: DIA_PLAYA_NEW already has CANCELADA_PLAYA format.
+        # Derive dia_new from TURNO_REPARTO when DIA_SALIDA_NEW is absent (new format)
+        if not dia_new and turno:
+            dia_new = _derive_dia_new_from_turno(turno)
+
+        # ── Extract playa name ────────────────────────────────────────────────
         if playa_idx is not None and g(playa_idx):
             playa = g(playa_idx)
-        elif tipo == "ESPECIAL DIA CAMBIO" and dpo:
-            # DIA_PLAYA_ORIGINAL = "MARTES_ESPANA_GUARROMAN" → playa = ESPANA_GUARROMAN
+        elif tipo in ("ESPECIAL DIA CAMBIO",) and dpo:
             playa = _extract_playa(dpo)
-            # Also extract dia_orig from DIA_PLAYA_ORIGINAL if DIA_SALIDA_ORIGINAL is missing
             if not dia_orig:
                 m = _DAY_PFX.match(dpo)
                 if m:
                     dia_orig = m.group(1).upper()
         elif dpn:
             playa = _extract_playa(dpn)
-            # Detect masculine CANCELADO_ prefix
             if dpn.upper().startswith("CANCELADO_"):
                 cancelado_masc.append(dpn)
         else:
@@ -239,22 +303,36 @@ def _load_parrilla(xlsx_bytes: bytes) -> Dict:
             if m:
                 dia_orig = m.group(1).upper()
 
+        # dia_orig from DIA_PLAYA prefix when DIA_SALIDA_ORIGINAL is absent (new format)
+        if not dia_orig and dpn:
+            m = _DAY_PFX.match(dpn)
+            if m:
+                dia_orig = m.group(1).upper()
+
         if not playa or not tipo:
             continue
 
-        # Normalise tipo → kind
-        if tipo in ("REGULAR", "HABITUAL", "ESPECIAL CUTOFF"):
-            stats["regular"] += 1
-            kind = "regular"
-        elif tipo == "CANCELADA":
+        # ── Normalize tipo → kind ─────────────────────────────────────────────
+        # Order matters: check CANCELADA variants first, then ESPECIAL variants
+        if tipo.startswith("CANCELADA"):
+            # Handles: CANCELADA, CANCELADA (MOVIDO A S21), etc.
             stats["cancelada"] += 1
             kind = "cancelada"
-        elif tipo == "ESPECIAL DIA CAMBIO":
+        elif "ESPECIAL" in tipo and "DIA" in tipo:
+            # Handles: ESPECIAL DIA CAMBIO, ESPECIAL DIA, ESPECIAL DIA+CUTOFF,
+            #          ESPECIAL DIA + CUTOFF — all involve a day change
             stats["especial"] += 1
             kind = "especial"
-        elif tipo == "IRREGULAR":
-            stats["irregular"] += 1
-            kind = "irregular"
+        elif tipo in ("REGULAR", "HABITUAL", "ESPECIAL CUTOFF", "BI SEMANAL",
+                      "IRREGULAR"):
+            # ESPECIAL CUTOFF → only cutoff changes, not day → treat as regular
+            # BI SEMANAL → normal cadence (may go twice a week) → treat as regular
+            if tipo == "IRREGULAR":
+                stats["irregular"] += 1
+                kind = "irregular"
+            else:
+                stats["regular"] += 1
+                kind = "regular"
         else:
             stats["other"] += 1
             kind = "other"
@@ -285,7 +363,7 @@ def _load_parrilla(xlsx_bytes: bytes) -> Dict:
         "col_issues": col_issues,
         "records": records,
         "stats": stats,
-        "has_playa_col": has_playa,
+        "has_playa_col": has_playa or has_dpn,
         "has_bloques_sheet": has_bloques_sheet or bool(bloques_alt),
         "cancelado_masc": cancelado_masc,
     }
@@ -351,18 +429,20 @@ def _load_gd_playas(xlsx_bytes: bytes) -> Dict:
 
 # ── Main validation ───────────────────────────────────────────────────────────
 
-def validate(parrilla_bytes: bytes, gd_bytes: Optional[bytes] = None) -> List[Dict]:
+def validate(parrilla_bytes: bytes, gd_bytes: Optional[bytes] = None,
+             sheet_name: Optional[str] = None) -> List[Dict]:
     """
     Run all validations. Returns list of issue dicts.
+    sheet_name: the parrilla sheet selected by the user (e.g. "AGENDA S26 Sant Joan").
     GD is optional — without it, cobertura checks are skipped.
     """
     issues = []
 
     # ── 1. Parse parrilla ─────────────────────────────────────────────────────
-    par = _load_parrilla(parrilla_bytes)
+    par = _load_parrilla(parrilla_bytes, sheet_name=sheet_name)
     issues.extend(par["col_issues"])
 
-    records  = par["records"]
+    records    = par["records"]
     especiales = [r for r in records if r["tipo"] == "especial"]
     canceladas = [r for r in records if r["tipo"] == "cancelada"]
 
@@ -385,12 +465,15 @@ def validate(parrilla_bytes: bytes, gd_bytes: Optional[bytes] = None) -> List[Di
 
     # Warn if zero especiales and zero canceladas — likely a read problem
     if len(especiales) == 0 and len(canceladas) == 0 and len(records) > 0:
+        tipo_vals = list({r["tipo"] for r in records})[:10]
         issues.append(_issue(
             "error", "contenido",
             "No se detectó ninguna especial ni cancelada",
-            "Hay registros en la parrilla pero ninguno es ESPECIAL DIA CAMBIO ni CANCELADA. "
-            "Es posible que la columna TIPO_SALIDA tenga valores distintos a los esperados.",
-            items=list({r["tipo"] for r in records})[:10],
+            "Hay registros en la parrilla pero ninguno tiene TIPO_SALIDA de tipo "
+            "ESPECIAL DIA (*) ni CANCELADA. "
+            "Comprueba que la hoja seleccionada es la del evento especial (ej. AGENDA S26 ...), "
+            "no la hoja base B2B.",
+            items=tipo_vals,
         ))
 
     # Especiales without new day
@@ -398,9 +481,9 @@ def validate(parrilla_bytes: bytes, gd_bytes: Optional[bytes] = None) -> List[Di
     if esp_sin_dia:
         issues.append(_issue(
             "warning", "contenido",
-            f"{len(esp_sin_dia)} especiales sin DIA_SALIDA_NEW",
-            "Estas especiales no tienen día de destino definido — se intentará derivar "
-            "del ID_CLUSTER pero puede fallar.",
+            f"{len(esp_sin_dia)} especiales sin día nuevo identificado",
+            "No se pudo determinar el nuevo día de expedición (ni de DIA_SALIDA_NEW "
+            "ni de TURNO_REPARTO). Se intentará derivar del ID_CLUSTER pero puede fallar.",
             items=[r["playa"] for r in esp_sin_dia[:10]],
         ))
 
@@ -435,12 +518,8 @@ def validate(parrilla_bytes: bytes, gd_bytes: Optional[bytes] = None) -> List[Di
     gd_playas    = gd["all_playas"]
     gd_e2_playas = gd.get("e2_playas", set())
 
-    # Para cada especial, verificar que existe config en el GD del DÍA ORIGINAL.
-    # El GD del día nuevo NO existe todavía — la aplicación lo crea.
-    # Si no hay config en el día original, el script intenta fallback a otro día;
-    # si no hay config en ningún día, no puede asignar posiciones.
-    sin_config_ninguno = []   # playa no existe en GD en ningún día
-    sin_config_orig    = []   # playa existe en GD pero no en el día original (usará fallback)
+    sin_config_ninguno = []
+    sin_config_orig    = []
     ok_count = 0
 
     seen = set()
@@ -452,7 +531,6 @@ def validate(parrilla_bytes: bytes, gd_bytes: Optional[bytes] = None) -> List[Di
         seen.add(playa)
 
         if playa in gd_e2_playas:
-            # Has config in GD but as E2 route — not a sorter position
             sin_config_orig.append({**r, "found_on_days": ["E2/MANUAL"]})
         elif playa not in gd_playas:
             sin_config_ninguno.append(r)
@@ -470,8 +548,8 @@ def validate(parrilla_bytes: bytes, gd_bytes: Optional[bytes] = None) -> List[Di
         ))
 
     if sin_config_orig:
-        e2_in_orig = [r for r in sin_config_orig if r.get("found_on_days") == ["E2/MANUAL"]]
-        fallback_orig = [r for r in sin_config_orig if r.get("found_on_days") != ["E2/MANUAL"]]
+        e2_in_orig     = [r for r in sin_config_orig if r.get("found_on_days") == ["E2/MANUAL"]]
+        fallback_orig  = [r for r in sin_config_orig if r.get("found_on_days") != ["E2/MANUAL"]]
 
         if e2_in_orig:
             issues.append(_issue(
@@ -498,13 +576,13 @@ def validate(parrilla_bytes: bytes, gd_bytes: Optional[bytes] = None) -> List[Di
         issues.append(_issue(
             "error", "cobertura",
             f"{len(sin_config_ninguno)} especiales SIN config en el GD en ningún día",
-            "Estas playas aparecen como ESPECIAL DIA CAMBIO en la parrilla pero no tienen "
+            "Estas playas aparecen como ESPECIAL DIA en la parrilla pero no tienen "
             "ninguna entrada POSTEX en el GD origen. Sin esa base no se pueden calcular "
             "qué posiciones asignar en el nuevo día — quedarán sin sort map.",
             items=[r["playa"] for r in sin_config_ninguno],
         ))
 
-    # Check canceladas: warn if any cancelada IS in GD (REVISAR cases)
+    # Canceladas que siguen en GD (REVISAR cases)
     canceladas_en_gd = []
     seen_c = set()
     for r in canceladas:
@@ -516,7 +594,6 @@ def validate(parrilla_bytes: bytes, gd_bytes: Optional[bytes] = None) -> List[Di
             canceladas_en_gd.append(r)
 
     if canceladas_en_gd:
-        # Group by playa to show all cancelled days
         _can_dias: dict = {}
         for _r in canceladas_en_gd:
             _p = _r["playa"]
@@ -536,8 +613,9 @@ def validate(parrilla_bytes: bytes, gd_bytes: Optional[bytes] = None) -> List[Di
             items=_can_items[:20],
         ))
 
-    # ── Zona consistency: parrilla E2 vs GD sorter elements ──────────────────
-    issues.extend(validate_zona_consistency(parrilla_bytes, gd_bytes))
+    # Zona consistency check
+    issues.extend(validate_zona_consistency(parrilla_bytes, gd_bytes,
+                                            sheet_name=sheet_name))
 
     return issues
 
@@ -596,9 +674,6 @@ def _load_gd_output(xlsx_bytes: bytes) -> Dict:
         if zona != "POSTEX" or not _SORTER_RE.match(elem):
             continue
 
-        # _CANCELADA_SOLO_W* entries are leftover positions from previous weeks.
-        # Treat them as normal occupied slots — strip the suffix so playa name
-        # parses correctly, but keep the entry in the map.
         if re.search(r"_CANCELADA_SOLO_W[^_\s]*", desc, re.IGNORECASE):
             desc = re.sub(r"_CANCELADA_SOLO_W[^_\s)]*", "", desc)
 
@@ -608,7 +683,6 @@ def _load_gd_output(xlsx_bytes: bytes) -> Dict:
 
         dia = dia.upper()
         playa = playa.upper()
-        # Strip (ESPECIAL...) suffix added by process_parrilla for new-day entries
         playa = re.sub(r"\s*\(ESPECIAL.*\)$", "", playa).strip()
 
         playas_por_dia[dia].add(playa)
@@ -617,22 +691,16 @@ def _load_gd_output(xlsx_bytes: bytes) -> Dict:
     return {"playas_por_dia": dict(playas_por_dia), "all_playas": all_playas}
 
 
-def validate_output(parrilla_bytes: bytes, gd_output_bytes: bytes) -> List[Dict]:
+def validate_output(parrilla_bytes: bytes, gd_output_bytes: bytes,
+                    sheet_name: Optional[str] = None) -> List[Dict]:
     """
     Post-generation validation: cross-check the generated GD against the parrilla.
-
-    Checks:
-      1. Especiales → must appear in sort map on the NEW day
-      2. Canceladas → must NOT appear in sort map on ANY day
-      3. Especiales → must NOT appear in sort map on the ORIGINAL day (moved away)
-
-    Returns list of issue dicts (same format as validate()).
+    sheet_name: the parrilla sheet selected by the user.
     """
     issues = []
 
-    # Parse parrilla (reuse existing loader)
-    par = _load_parrilla(parrilla_bytes)
-    records  = par["records"]
+    par = _load_parrilla(parrilla_bytes, sheet_name=sheet_name)
+    records    = par["records"]
     especiales = [r for r in records if r["tipo"] == "especial"]
     canceladas = [r for r in records if r["tipo"] == "cancelada"]
 
@@ -644,7 +712,6 @@ def validate_output(parrilla_bytes: bytes, gd_output_bytes: bytes) -> List[Dict]
         ))
         return issues
 
-    # Parse generated GD output
     out = _load_gd_output(gd_output_bytes)
     playas_por_dia = out["playas_por_dia"]
     all_playas_out = out["all_playas"]
@@ -658,8 +725,7 @@ def validate_output(parrilla_bytes: bytes, gd_output_bytes: bytes) -> List[Dict]
         if playa in seen or not dia_new:
             continue
         seen.add(playa)
-        playas_en_dia_new = playas_por_dia.get(dia_new, set())
-        if playa in playas_en_dia_new:
+        if playa in playas_por_dia.get(dia_new, set()):
             esp_ok.append(r)
         else:
             esp_falta.append(r)
@@ -672,11 +738,10 @@ def validate_output(parrilla_bytes: bytes, gd_output_bytes: bytes) -> List[Dict]
         ))
 
     if esp_falta:
-        # Separate E2/manual routes (expected to be absent) from real missing ones
         _E2_KNOWN = {"BOSNIA_CPT","CHIPRE_NORTE","INDONESIA","CHIPRE",
                      "BOSNIA_CPT_2","CHIPRE_NORTE_2","INDONESIA_CPT"}
-        esp_falta_e2    = [r for r in esp_falta if r["playa"] in _E2_KNOWN]
-        esp_falta_real  = [r for r in esp_falta if r["playa"] not in _E2_KNOWN]
+        esp_falta_e2   = [r for r in esp_falta if r["playa"] in _E2_KNOWN]
+        esp_falta_real = [r for r in esp_falta if r["playa"] not in _E2_KNOWN]
 
         if esp_falta_e2:
             issues.append(_issue(
@@ -690,17 +755,12 @@ def validate_output(parrilla_bytes: bytes, gd_output_bytes: bytes) -> List[Dict]
             issues.append(_issue(
                 "error", "resultado",
                 f"{len(esp_falta_real)} especiales NO encontradas en el sort map en el día nuevo",
-                "Estaban en la parrilla como ESPECIAL DIA CAMBIO pero no aparecen "
+                "Estaban en la parrilla como ESPECIAL DIA pero no aparecen "
                 "en el día nuevo del GD generado. Revisa si tienen config en el GD origen.",
                 items=[f"{r['playa']}  ({r['dia_orig']} → {r['dia_new']})" for r in esp_falta_real],
             ))
 
-    # ── Check 2: Canceladas NO deben estar en el día CANCELADO ──────────────────
-    # Una playa puede estar cancelada el LUNES pero tener salida REGULAR el JUEVES:
-    # el check es por (dia_cancelada, playa), no "en ningún día".
-    # Además, filtramos solo canceladas "reales": cuyo DPN empieza por CANCELADA_/CANCELADO_
-    # (las que tienen DPN=DIA_PLAYA son especiales que también están marcadas como cancelada
-    # en la parrilla pero corresponden a la salida movida, no a una eliminación real).
+    # ── Check 2: Canceladas NO deben estar en su día cancelado ───────────────
     can_ok, can_presentes = [], []
     dias_cancelada: Dict[str, set] = defaultdict(set)
     for r in canceladas:
@@ -708,12 +768,12 @@ def validate_output(parrilla_bytes: bytes, gd_output_bytes: bytes) -> List[Dict]
             dpn_up = r["dpn_raw"].upper()
             if dpn_up.startswith("CANCELADA_") or dpn_up.startswith("CANCELADO_"):
                 dias_cancelada[r["playa"]].add(r["dia_orig"])
+        # New format: CANCELADA without DPN prefix — use dia_orig directly
+        elif r["tipo"] == "cancelada" and r["dia_orig"]:
+            dias_cancelada[r["playa"]].add(r["dia_orig"])
 
     for playa, dias_can in dias_cancelada.items():
-        dias_mal = []
-        for dia in dias_can:
-            if playa in playas_por_dia.get(dia, set()):
-                dias_mal.append(dia)
+        dias_mal = [dia for dia in dias_can if playa in playas_por_dia.get(dia, set())]
         if dias_mal:
             can_presentes.append({"playa": playa, "dias_cancelada": sorted(dias_can),
                                    "dias_mal": sorted(dias_mal)})
@@ -741,13 +801,10 @@ def validate_output(parrilla_bytes: bytes, gd_output_bytes: bytes) -> List[Dict]
         ))
 
     # ── Check 3: Especiales NO deben estar en el día ORIGINAL ─────────────────
-    # Build set of (dia, playa) that are confirmed cancelled (real CANCELADA_ rows)
     confirmed_cancelled_days: set = set()
     for r in canceladas:
-        if r["dia_orig"] and r.get("dpn_raw",""):
-            dpn_up = r["dpn_raw"].upper()
-            if dpn_up.startswith("CANCELADA_") or dpn_up.startswith("CANCELADO_"):
-                confirmed_cancelled_days.add((r["dia_orig"], r["playa"]))
+        if r["dia_orig"]:
+            confirmed_cancelled_days.add((r["dia_orig"], r["playa"]))
 
     esp_still_orig_ok, esp_still_orig = [], []
     seen3 = set()
@@ -757,10 +814,7 @@ def validate_output(parrilla_bytes: bytes, gd_output_bytes: bytes) -> List[Dict]
         if playa in seen3 or not dia_orig:
             continue
         seen3.add(playa)
-        playas_en_dia_orig = playas_por_dia.get(dia_orig, set())
-        if playa in playas_en_dia_orig:
-            # Only flag if this day was NOT also explicitly cancelled
-            # (a confirmed cancel means that entry was already removed correctly)
+        if playa in playas_por_dia.get(dia_orig, set()):
             if (dia_orig, playa) not in confirmed_cancelled_days:
                 esp_still_orig.append(r)
             else:
@@ -779,7 +833,7 @@ def validate_output(parrilla_bytes: bytes, gd_output_bytes: bytes) -> List[Dict]
         issues.append(_issue(
             "error", "resultado",
             f"{len(esp_still_orig)} especiales que SIGUEN en el día original",
-            "Estas playas son ESPECIAL DIA CAMBIO pero todavía aparecen en su día "
+            "Estas playas son ESPECIAL DIA pero todavía aparecen en su día "
             "original en el GD generado — deberían haberse eliminado al moverlas.",
             items=[f"{r['playa']}  (día orig: {r['dia_orig']})" for r in esp_still_orig],
         ))
@@ -787,7 +841,7 @@ def validate_output(parrilla_bytes: bytes, gd_output_bytes: bytes) -> List[Dict]
     # ── Tabla resumen: parrilla vs sort map por día ───────────────────────────
     DAYS_ORDER = ["DOMINGO","LUNES","MARTES","MIERCOLES","JUEVES","VIERNES","SABADO"]
 
-    par_by_dia_new: dict = defaultdict(list)
+    par_by_dia_new: dict  = defaultdict(list)
     par_by_dia_orig: dict = defaultdict(list)
     for r in especiales:
         if r["dia_new"]:
@@ -805,14 +859,12 @@ def validate_output(parrilla_bytes: bytes, gd_output_bytes: bytes) -> List[Dict]
         table_rows = []
         for dia in active_days:
             esp_llegan   = sorted(set(par_by_dia_new.get(dia, [])))
-            esp_salen    = sorted(set(par_by_dia_orig.get(dia, [])))
             sm_presentes = playas_por_dia.get(dia, set())
             match        = [p for p in esp_llegan if p in sm_presentes]
             faltantes    = [p for p in esp_llegan if p not in sm_presentes]
             table_rows.append({
                 "dia": dia, "par_llegan": len(esp_llegan),
-                "par_salen": len(esp_salen), "sm": len(sm_presentes),
-                "match": len(match), "faltantes": faltantes,
+                "sm": len(sm_presentes), "match": len(match), "faltantes": faltantes,
             })
 
         lines = []
@@ -835,19 +887,17 @@ def validate_output(parrilla_bytes: bytes, gd_output_bytes: bytes) -> List[Dict]
     return issues
 
 
-
 # ── Zona consistency check ────────────────────────────────────────────────────
 
-def validate_zona_consistency(parrilla_bytes: bytes, gd_bytes: bytes) -> List[Dict]:
+def validate_zona_consistency(parrilla_bytes: bytes, gd_bytes: bytes,
+                               sheet_name: Optional[str] = None) -> List[Dict]:
     """
     Check especiales where parrilla says zona=E2 but GD origen has real sorter elements.
-    The GD always takes precedence — this generates a warning to fix the parrilla.
     """
     issues = []
     if gd_bytes is None:
         return issues
 
-    # Build playa → has_sorter from GD origen
     from openpyxl import load_workbook as _lwb_z
     import re as _re_z
 
@@ -876,22 +926,36 @@ def validate_zona_consistency(parrilla_bytes: bytes, gd_bytes: bytes) -> List[Di
         if _SORTER_RE.match(elem) and not _E2_RE.match(elem):
             playa_has_sorter[pu] = True
 
-    # Check parrilla especiales with zona=E2 against GD
+    # Load parrilla with the selected sheet
     wb_p = _lwb_z(io.BytesIO(parrilla_bytes), read_only=True)
-    target = next((s for s in wb_p.sheetnames
-                   if any(str(h or "").strip().upper() == "TIPO_SALIDA"
-                          for h in next(wb_p[s].iter_rows(values_only=True, max_row=1), ()))),
-                  None)
+
+    # Use sheet_name if provided, else auto-detect
+    target = None
+    if sheet_name and sheet_name in wb_p.sheetnames:
+        ws_probe = wb_p[sheet_name]
+        hdr_probe = next(ws_probe.iter_rows(values_only=True, max_row=1), ())
+        if any(str(h or "").strip().upper() == "TIPO_SALIDA" for h in hdr_probe):
+            target = sheet_name
+    if not target:
+        target = next((s for s in wb_p.sheetnames
+                       if s.upper() not in _BASE_SHEETS and
+                       any(str(h or "").strip().upper() == "TIPO_SALIDA"
+                           for h in next(wb_p[s].iter_rows(values_only=True, max_row=1), ()))),
+                      None)
+    if not target:
+        target = next((s for s in wb_p.sheetnames
+                       if any(str(h or "").strip().upper() == "TIPO_SALIDA"
+                              for h in next(wb_p[s].iter_rows(values_only=True, max_row=1), ()))),
+                      None)
     if not target:
         return issues
 
     rows_p = list(wb_p[target].iter_rows(values_only=True))
     col_p = {str(h or "").strip().upper(): i for i, h in enumerate(rows_p[0]) if h}
 
-    import re as _re_z2
-    _DAY_RE_Z = _re_z2.compile(
+    _DAY_RE_Z = re.compile(
         r"^(?:DOMINGO|LUNES|MARTES|MIERCOLES|JUEVES|VIERNES|SABADO)_(.+)$",
-        _re_z2.IGNORECASE)
+        re.IGNORECASE)
 
     def _gv_p(row, col):
         i = col_p.get(col)
@@ -903,12 +967,14 @@ def validate_zona_consistency(parrilla_bytes: bytes, gd_bytes: bytes) -> List[Di
     seen = set()
     for r in rows_p[1:]:
         tipo = _gv_p(r, "TIPO_SALIDA").upper()
-        if "ESPECIAL DIA CAMBIO" not in tipo:
+        # Match all ESPECIAL DIA variants
+        if not ("ESPECIAL" in tipo and "DIA" in tipo):
             continue
         zona = _gv_p(r, "ZONA").upper()
         if zona != "E2":
             continue
-        dpo = _gv_p(r, "DIA_PLAYA_ORIGINAL")
+        # Try DIA_PLAYA_ORIGINAL first, then DIA_PLAYA (new format)
+        dpo = _gv_p(r, "DIA_PLAYA_ORIGINAL") or _gv_p(r, "DIA_PLAYA")
         _mz = _DAY_RE_Z.match(dpo)
         playa = _mz.group(1).strip().upper() if _mz else _gv_p(r, "AGRUPACION_PLAYA").upper()
         if not playa or playa in seen:
