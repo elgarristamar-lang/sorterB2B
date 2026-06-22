@@ -956,15 +956,25 @@ def write_day_sheet(
             CANC_FILL = _PF2("solid", fgColor="F0F0F0")   # gris muy claro
             CANC_FONT = _F2(size=8, bold=False, italic=True, color="999999", strike=True)
             _esp_playa_names = {p.upper() for p in esp_playa_slots} if esp_playa_slots else set()
-            for _canc_pl in sorted(set(canceladas_dia)):
+            # Items may be (playa, bloque) tuples or bare playa strings (legacy).
+            _canc_norm = []
+            for _it in canceladas_dia:
+                if isinstance(_it, tuple):
+                    _canc_norm.append((_it[0], _it[1] if len(_it) > 1 else ''))
+                else:
+                    _canc_norm.append((_it, ''))
+            for _canc_pl, _canc_bl in sorted(set(_canc_norm), key=lambda x: x[0]):
                 # Skip if already shown as ⚠ REVISAR (it's in esp_playa_slots)
                 if _canc_pl.upper() in _esp_playa_names: continue
-                vals = [day_name, _canc_pl, "—", "CANCELADA"]
+                # Short bloque code: 3BLOM5 → M5
+                _bl_short = ''
+                _bm = re.search(r'BLO([DLMXJVS]\d)', str(_canc_bl).upper()) if _canc_bl else None
+                if _bm: _bl_short = _bm.group(1)
+                vals = [day_name, _canc_pl, _bl_short or "—", "CANCELADA"]
                 alns = [_center, _left, _center, _left]
                 for ci, (val, aln) in enumerate(zip(vals, alns), SC):
                     c = ws.cell(row=sr, column=ci, value=val)
                     c.fill = CANC_FILL; c.border = border; c.alignment = aln
-                    # Strikethrough on playa name, muted on rest
                     if ci == SC+1:
                         c.font = _F2(size=8, bold=False, italic=True, color="999999", strike=True)
                     else:
@@ -1650,8 +1660,17 @@ def main():
 
                     if _tipo.startswith('CANCELADA'):
                         _cancelled_esp.add(_playa.upper())
-                        if _dia_ori:
-                            _canceladas_por_dia[_dia_ori].append(_playa)
+                        # Canceladas go in the tab of the BLOQUE that is being
+                        # cancelled (turno), not the salida day. The bloque letter
+                        # (e.g. 3BLOM5 → M → MARTES, 4BLOX1 → X → MIERCOLES) decides.
+                        _canc_day = None
+                        _bm_canc = re.search(r'BLO([DLMXJVS])\d', (_bloque or '').upper())
+                        if _bm_canc:
+                            _canc_day = _LETRA_DIA.get(_bm_canc.group(1))
+                        if not _canc_day:
+                            _canc_day = _dia_ori  # fallback to salida day
+                        if _canc_day:
+                            _canceladas_por_dia[_canc_day].append((_playa, _bloque))
 
                     elif _is_esp_dia:
                         # E2: known routes OR (zona=E2 AND GD confirms no sorter elements)
