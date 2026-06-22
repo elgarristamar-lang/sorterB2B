@@ -570,6 +570,17 @@ def _resolve_gd_playa(playa, by_dia_playa):
     return playa
 
 
+def _bloque_of_entry(e):
+    """Return the bloque code of a tagged GD entry, normalized upper, or ''."""
+    b = e.get('bloque') or ''
+    return str(b).strip().upper()
+
+
+def _subslot_of_entry(e):
+    """Return (subramp, slot) parsed from the entry's elemento, or (None, None)."""
+    return parse_rampa(e.get('elemento'))
+
+
 def assign_especial(orig_dia, orig_playa, new_dia, raw_bloque, id_cluster,
                     by_dia_playa, tagged, capacity, bloque_timings, freed_in_new_dia,
                     run_occ_new_dia=None, preferred_rampas=None, all_especial_playas=None,
@@ -593,6 +604,40 @@ def assign_especial(orig_dia, orig_playa, new_dia, raw_bloque, id_cluster,
     gd_playa = _resolve_gd_playa(orig_playa, by_dia_playa)
     if gd_playa and gd_playa != orig_playa:
         orig_playa = gd_playa
+
+    # ── KEEP-RAMP case ────────────────────────────────────────────────────────
+    # If the playa already runs in this exact bloque somewhere in the GD, then the
+    # special week does NOT change its delivery shift (turno) — only the salida
+    # date changes (e.g. CATALUNYA stays in 3BLOM6 on R05C/R05D/R07B; it just ships
+    # Thursday instead of Wednesday). In that case we must NOT reassign ramps; the
+    # playa keeps its existing positions. We still report it as a special so it
+    # shows in the side panel.
+    _norm_bloque = (raw_bloque or '').strip().upper()
+    if _norm_bloque and _norm_bloque not in ('#N/A','NO_BLOQUE','?',''):
+        _existing_same_bloque = [
+            e for e in tagged
+            if e.get('playa') == orig_playa
+            and e['tipo_zona'] in ('POSTEX', 'SOREXP') and e['is_sorter']
+            and _bloque_of_entry(e) == _norm_bloque
+        ]
+        if _existing_same_bloque:
+            _ramps = {}
+            for e in _existing_same_bloque:
+                if e['tipo_zona'] != 'POSTEX':
+                    continue
+                _sub, _slot = _subslot_of_entry(e)
+                if _sub is None:
+                    continue
+                _ramps.setdefault(_sub, set()).add(_slot)
+            _n_pos = sum(len(s) for s in _ramps.values())
+            return [], {
+                'status': 'KEEP_RAMP', 'playa': orig_playa,
+                'dia_orig': orig_dia, 'dia_new': new_dia,
+                'bloque': _norm_bloque,
+                'rampas': {k: sorted(v) for k, v in _ramps.items()},
+                'n_assigned': _n_pos, 'n_destinos': _n_pos,
+                'msg': f'Mantiene rampa (turno {_norm_bloque} sin cambio; solo cambia salida)',
+            }
 
     new_bloque = None
     if raw_bloque and raw_bloque not in ('#N/A','NO_BLOQUE','?',''):
@@ -956,10 +1001,30 @@ def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, fi
 
     freed_per_day = defaultdict(set)
     mantener_set: set = set()  # (dia_orig, playa) → keep original entries
+
+    # Pre-compute KEEP-RAMP especiales: those whose parrilla bloque already exists
+    # in the GD for that playa (turno unchanged, only salida date changes). Their
+    # original rows must be kept (not removed) and not reassigned.
+    _gd_blocks_by_playa = defaultdict(set)
+    for e in tagged:
+        if e['is_sorter'] and e.get('playa') and e.get('bloque'):
+            _gd_blocks_by_playa[e['playa']].add(str(e['bloque']).strip().upper())
+    keep_ramp_set: set = set()
+    _keep_bloques: dict = {}   # playa → bloque that it keeps
+    for (dia_orig, playa), (dia_new, r) in especiales.items():
+        _pb = str(r.get('bloque', '') or '').strip().upper()
+        _gd_playa = _resolve_gd_playa(playa, by_dia_playa)
+        if _pb and _pb in _gd_blocks_by_playa.get(_gd_playa, set()):
+            keep_ramp_set.add((dia_orig, playa))
+            _keep_bloques[_gd_playa] = _pb
+            _keep_bloques[playa] = _pb
+
     for (dia, playa) in canceladas: freed_per_day[dia].add(playa)
     for (dia_orig, playa), (dia_new, r) in especiales.items():
         if r.get('mantener_original'):
             mantener_set.add((dia_orig, playa))
+        elif (dia_orig, playa) in keep_ramp_set:
+            pass  # keep ramp → don't free its slots, don't reassign
         else:
             freed_per_day[dia_orig].add(playa)
 
@@ -971,6 +1036,22 @@ def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, fi
             output_rows.append(entry['_raw']); kept_nw += 1; continue
         key = (entry['dia'], entry['playa'])
         if key in canceladas: rem_cancel += 1; continue
+        # KEEP-RAMP: match by playa + bloque (the GD row's day differs from the
+        # parrilla's original day, so we can't key on day alone).
+        _kr_playa = entry.get('playa')
+        _kr_bloque = str(entry.get('bloque') or '').strip().upper()
+        _is_keep_ramp = any(
+            p == _kr_playa and _kr_bloque and _kr_bloque == _keep_bloques.get(p)
+            for (_d, p) in keep_ramp_set
+        )
+        if _is_keep_ramp:
+            _raw = entry['_raw']
+            _desc = str(_raw[2] or '')
+            if '(ESPECIAL' not in _desc.upper():
+                _desc = _desc + ' (ESPECIAL MANTIENE RAMPA)'
+            output_rows.append((_raw[0], _raw[1], _desc, _raw[3], _raw[4], _raw[5], _raw[6]))
+            kept += 1
+            continue
         if key in especiales and key not in mantener_set:
             rem_moved += 1; continue
         elif key in especiales and key in mantener_set:
@@ -1061,6 +1142,11 @@ def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, fi
             new_rows.extend(_rows_b)
             if _info_b.get('status') == 'OK':
                 info = _info_b  # keep last OK info for tracking
+            elif _info_b.get('status') == 'KEEP_RAMP':
+                # Special that keeps its ramp (turno unchanged, only salida date).
+                # No new rows; record it so it shows in the summary/side panel.
+                if info.get('status') in ('NO_CONFIG', 'E2_ROUTE'):
+                    info = _info_b
             elif _info_b.get('status') in ('E2_ROUTE', 'NO_CONFIG') and info.get('status') == 'NO_CONFIG':
                 info = _info_b  # propagate E2_ROUTE/NO_CONFIG if nothing better yet
         # Update sibling proximity tracking
@@ -1531,18 +1617,26 @@ def main():
     partial = [r for r in summary['assignment_results'] if r['status'] == 'PARTIAL']
     e2      = [r for r in summary['assignment_results'] if r['status'] == 'E2_ROUTE']
     nocfg   = [r for r in summary['assignment_results'] if r['status'] == 'NO_CONFIG']
+    keep    = [r for r in summary['assignment_results'] if r['status'] == 'KEEP_RAMP']
 
     print(f"\n{'='*65}")
     print(f"RESUMEN {semana}:")
     print(f"  Canceladas:             {summary['n_canceladas']} ({summary['rows_removed_cancelled']:,} filas)")
     print(f"  Cambios de día:         {summary['n_especiales']}")
     print(f"    → Asignados OK:       {len(ok)}")
+    print(f"    → Mantienen rampa:    {len(keep)}")
     print(f"    → Rutas E2:           {len(e2)}")
     print(f"    → Sin config GD:      {len(nocfg)}")
     print(f"    → Parciales:          {len(partial)}")
     print(f"  Filas añadidas:         {summary['rows_added_especial']:,}")
     print(f"  Filas output total:     {summary['total_output_rows']:,}")
     print(f"{'='*65}")
+
+    if keep:
+        print("\nMantienen rampa (turno sin cambio, solo cambia salida):")
+        for r in keep:
+            rstr = ', '.join(f"{k}({len(v)}p)" for k,v in sorted(r.get('rampas',{}).items()))
+            print(f"  {r['playa']:42s} {r['dia_orig']}→{r['dia_new']} [{r.get('bloque','?')}]  {rstr}")
 
     if ok:
         print("\nAsignaciones completadas:")
