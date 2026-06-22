@@ -1,4 +1,4 @@
-# Version: 0.04
+# Version: 0.05
 # sorter_map_excel_por_dia.py
 # ---------------------------------------------------------
 # Genera un Excel "Sorter Map" en formato slots:
@@ -902,9 +902,15 @@ def write_day_sheet(
                         f"{sub}[{','.join(str(s) for s in sorted(slots))}]"
                         for sub, slots in sorted(by_sub.items(), key=lambda x: ramp_sort_key(x[0]))
                     )
-                    # Check if this playa is cancelled in the semana especial sheet
+                    # Check if this playa is cancelled in the semana especial sheet.
+                    # BUT a playa can be cancelled on one day and run as an active
+                    # especial on another (e.g. BENAVENTE_TSA: cancelled Wed, especial
+                    # cutoff Tue). If it has real positions here, it's active → not
+                    # cancelled. Only mark REVISAR when there are no positions.
+                    _has_positions = bool(pos_str and pos_str.strip())
                     _is_cancelled = (cancelled_esp is not None
-                                     and playa.upper() in cancelled_esp)
+                                     and playa.upper() in cancelled_esp
+                                     and not _has_positions)
                     vals = [dia_display, playa, bt,
                             "⚠ CANCELADA — REVISAR" if _is_cancelled else pos_str]
                     alns = [_center, _left, _center, _wrap]
@@ -1483,7 +1489,7 @@ def write_validation_sheet(ws, grupo_df, cap_map, block_intervals,
     ws.freeze_panes = "A3"
 
 def main():
-    print("=== Generador SORTER_MAP Excel v0.04 (formato S26+) ===")
+    print("=== Generador SORTER_MAP Excel v0.05 (formato S26+) ===")
 
     cap_map = load_capacity(CAPACITY_CSV)
     grupo = load_grupo_destinos(GRUPO_XLSX, GRUPO_SHEET)
@@ -1629,7 +1635,7 @@ def main():
 
                     # Playa: for especiales prefer DIA_PLAYA_ORIGINAL, then DIA_PLAYA_NEW,
                     # then DIA_PLAYA (new format).
-                    _is_esp_dia = ('ESPECIAL' in _tipo and 'DIA' in _tipo)
+                    _is_esp_dia = ('ESPECIAL' in _tipo and ('DIA' in _tipo or 'CUTOFF' in _tipo or 'CUT-OFF' in _tipo))
                     if _is_esp_dia and _dpo:
                         _playa = _extract_playa_ss(_dpo, _dpn) or _extract_playa_ss(_dpl, '')
                     else:
