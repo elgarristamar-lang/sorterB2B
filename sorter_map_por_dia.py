@@ -1,4 +1,4 @@
-# Version: 0.03
+# Version: 0.04
 # sorter_map_excel_por_dia.py
 # ---------------------------------------------------------
 # Genera un Excel "Sorter Map" en formato slots:
@@ -524,6 +524,7 @@ def write_day_sheet(
     especial_colors: Optional[Dict[str, str]] = None,
     playa_by_block: Optional[Dict[str, Dict[str, Dict[int, Set[str]]]]] = None,
     e2_playas: Optional[List[Tuple[str, str]]] = None,
+    salida_by_playa: Optional[Dict[str, str]] = None,  # playa → DIA_SALIDA for panel
     cancelled_esp=None,       # set of cancelled playa names (for conflict detection)
     canceladas_dia=None,      # list of playa names cancelled on this day
     especiales_salientes=None, # list of (playa, dia_new, bloque) leaving this day
@@ -891,6 +892,12 @@ def write_day_sheet(
                         sub, slot = entry[0], entry[1]
                         if len(entry) > 2 and entry[2]: dia_display = entry[2]
                         by_sub[sub].append(slot)
+                    # Per rule: the DÍA column shows the day of SALIDA (from the
+                    # parrilla), not the GD row's original day. Override if known.
+                    if salida_by_playa:
+                        _sd = salida_by_playa.get(playa.upper())
+                        if _sd:
+                            dia_display = _sd
                     pos_str = " · ".join(
                         f"{sub}[{','.join(str(s) for s in sorted(slots))}]"
                         for sub, slots in sorted(by_sub.items(), key=lambda x: ramp_sort_key(x[0]))
@@ -1476,7 +1483,7 @@ def write_validation_sheet(ws, grupo_df, cap_map, block_intervals,
     ws.freeze_panes = "A3"
 
 def main():
-    print("=== Generador SORTER_MAP Excel v0.03 (formato S26+) ===")
+    print("=== Generador SORTER_MAP Excel v0.04 (formato S26+) ===")
 
     cap_map = load_capacity(CAPACITY_CSV)
     grupo = load_grupo_destinos(GRUPO_XLSX, GRUPO_SHEET)
@@ -1498,6 +1505,7 @@ def main():
     _canceladas_por_dia: dict = defaultdict(list)  # dia_orig → [playa]
     _especiales_por_dia_orig: dict = defaultdict(list)  # dia_orig → [(playa, dia_new, bloque)]
     _salidas_extra_por_dia: dict = defaultdict(list)   # dia → [(playa, bloque)]
+    _salida_by_playa: dict = {}   # playa(upper) → DIA_SALIDA (the salida day shown in panel)
     _cancelled_esp: set = set()
     _KNOWN_E2 = {"BOSNIA_CPT","CHIPRE_NORTE","INDONESIA","CHIPRE",
                  "BOSNIA_CPT_2","CHIPRE_NORTE_2","INDONESIA_CPT"}
@@ -1628,6 +1636,12 @@ def main():
                         _playa = _extract_playa_ss(_dpn, _dpo) or _extract_playa_ss(_dpl, '')
                     if not _playa: continue
 
+                    # Record the salida day (DIA_SALIDA) for this playa, used as the
+                    # DÍA column in the side panel (per rule: día = día de salida).
+                    _ds_panel = _g('DIA_SALIDA').upper()
+                    if _ds_panel and _is_esp_dia:
+                        _salida_by_playa[_playa.upper()] = _ds_panel
+
                     if _tipo.startswith('CANCELADA'):
                         _cancelled_esp.add(_playa.upper())
                         if _dia_ori:
@@ -1704,6 +1718,7 @@ def main():
             especial_colors=especial_colors,
             playa_by_block=playa_by_block,
             e2_playas=_e2_by_day.get(day_name, []),
+            salida_by_playa=_salida_by_playa,
             cancelled_esp=_cancelled_esp,
             canceladas_dia=_canceladas_por_dia.get(day_name, []),
             especiales_salientes=_especiales_por_dia_orig.get(day_name, []),
