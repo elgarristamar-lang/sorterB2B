@@ -988,15 +988,18 @@ def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, fi
         #  - CANCELADA / CANCELADA (MOVIDO...) → cancelada
         #  - any ESPECIAL with DIA in the name (ESPECIAL DIA, ESPECIAL DIA+CUTOFF,
         #    ESPECIAL DIA + CUTOFF, ESPECIAL DIA CAMBIO) → especial (day change)
-        #  - HABITUAL/REGULAR/ESPECIAL CUTOFF/BI SEMANAL → habitual (no day change)
+        #  - ESPECIAL CUTOFF → also especial: the keep-ramp / reassign logic decides
+        #    whether it stays (block unchanged, e.g. LYON M1) or moves to a new ramp
+        #    (block changed, e.g. BENAVENTE_TSA M2→M1). Either way it shows in panel.
+        #  - HABITUAL/REGULAR/BI SEMANAL → habitual (no change)
         _tipo_up = tipo.upper().strip()
         if _tipo_up.startswith('CANCELADA'):
             canceladas[(dia_orig, playa)] = r
-        elif 'ESPECIAL' in _tipo_up and 'DIA' in _tipo_up:
-            # day change special. dia_new defaults to dia_orig if it couldn't be
+        elif 'ESPECIAL' in _tipo_up and ('DIA' in _tipo_up or 'CUTOFF' in _tipo_up or 'CUT-OFF' in _tipo_up):
+            # day/ramp change special. dia_new defaults to dia_orig if it couldn't be
             # derived — assign_especial self-corrects the source day via fallback.
             especiales[(dia_orig, playa)] = (dia_new or dia_orig, r)
-        elif _tipo_up in ('HABITUAL', 'REGULAR', 'ESPECIAL CUTOFF', 'BI SEMANAL'):
+        elif _tipo_up in ('HABITUAL', 'REGULAR', 'BI SEMANAL'):
             habituales[(dia_orig, playa)] = r
 
     freed_per_day = defaultdict(set)
@@ -1171,8 +1174,12 @@ def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, fi
                     rampa = f"R{int(m.group(1)):02d}{m.group(2)}"
                     pos   = int(m.group(3))
                     run_occ.setdefault(dia_new, {}).setdefault(rampa, {})[pos] = info.get('grupo_new','ESP')
-        # Rename description if playa is cancelled in SEMANA SANTA
-        if cancelled_especiales and playa.upper() in cancelled_especiales and new_rows:
+        # Rename description if playa is cancelled in SEMANA SANTA — BUT only if it
+        # was NOT actively assigned as an especial here. A playa can be cancelled on
+        # one day and run as an especial (e.g. ESPECIAL CUTOFF) on another day; in
+        # that case it keeps its active rows and must not be marked cancelled.
+        _active_here = info.get('status') in ('OK', 'KEEP_RAMP') and bool(new_rows)
+        if cancelled_especiales and playa.upper() in cancelled_especiales and new_rows and not _active_here:
             semana = especial_bloque_map and next(
                 (k[1] for k in (especial_bloque_map or {}) if k[0]==dia_new and k[1]==playa), None)
             suffix = '_CANCELADA_SOLO_W14'
@@ -1670,8 +1677,11 @@ def main():
             for _r in rows:
                 _desc = str(_r[2] or '')
                 _renamed = _desc
+                # Don't mark a row cancelled if it is an ACTIVE especial this week
+                # (a playa can be cancelled one day and run as especial another day).
+                _is_active_esp = '(ESPECIAL' in _desc.upper()
                 for _cp in cancelled_especiales:
-                    if '_CANCELADA_SOLO_W14' in _desc:
+                    if '_CANCELADA_SOLO_W14' in _desc or _is_active_esp:
                         break
                     # Whole-token match: the playa must be followed by a boundary
                     # (end, space, '(', or '_' that is NOT a digit — so TSA does not
