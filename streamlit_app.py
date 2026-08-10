@@ -1,4 +1,4 @@
-# Version: 0.09
+# Version: 0.10
 import streamlit as st
 import subprocess, sys, tempfile, datetime as dt
 from pathlib import Path
@@ -9,6 +9,15 @@ BASE_DIR = Path(__file__).parent
 _BASE_SHEET_NAMES = {
     "B2B", "B2C", "BLOQUES", "RESUMEN BLOQUES", "VOLUMENES", "APY",
 }
+
+# ── Hojas de SEMANA NORMAL ───────────────────────────────────────────────────
+# Seleccionar una de estas en el desplegable dibuja la foto del GD tal cual:
+# no hay canceladas, ni especiales que cambien de día, ni reasignación de
+# rampas. Solo se marcan en amarillo las ESPECIAL DIA / ESPECIAL DIA+CUTOFF.
+_NORMAL_SHEET_NAMES = {"B2B"}
+
+def _is_normal_week_sheet(sheet_name: str) -> bool:
+    return (sheet_name or "").strip().upper() in _NORMAL_SHEET_NAMES
 
 def _is_event_sheet(sheet_name: str, headers: tuple) -> bool:
     """Return True if this sheet is an event/agenda sheet (not a base sheet)."""
@@ -41,6 +50,17 @@ def _detect_bloques_sheet(wb, event_sheet: str) -> str | None:
     import re as _re
     sheets = wb.sheetnames
     su = event_sheet.strip()
+
+    # 0. Semana normal (hoja B2B): le corresponde la hoja 'Bloques' genérica,
+    #    que es la que lleva los horarios de la semana estándar.
+    if _is_normal_week_sheet(su):
+        for s in sheets:
+            if s.strip().upper() == "BLOQUES":
+                return s
+        for s in sheets:
+            if s.strip().upper() == "RESUMEN BLOQUES":
+                return s
+        return None
 
     # 1. Exact suffix match
     for prefix in ("AGENDA ", "SEMANA SANTA ", "SEMANA "):
@@ -319,7 +339,17 @@ with col1:
             else:
                 _other_event.append(_sh)
 
-        _valid = _agenda_first + _other_event
+        # Hojas de semana normal (B2B): van al final del desplegable
+        _normal_sheets = []
+        for _sh in _all_sheets:
+            if not _is_normal_week_sheet(_sh):
+                continue
+            _ws_tmp = _wb_tmp[_sh]
+            _first  = next(_ws_tmp.iter_rows(values_only=True, max_row=1), None)
+            if _first and any(str(h or "").strip().upper() == "TIPO_SALIDA" for h in _first):
+                _normal_sheets.append(_sh)
+
+        _valid = _agenda_first + _other_event + _normal_sheets
 
         # Fallback: if no event sheet found, show all with TIPO_SALIDA
         if not _valid:
@@ -332,8 +362,15 @@ with col1:
         _options = _valid if _valid else _all_sheets
         _default_idx = 0  # Best candidate is first (AGENDA sheets are first)
 
-        sheet = st.selectbox("Hoja de parrilla", options=_options, index=_default_idx,
-                             help="Selecciona la pestaña con los datos del evento especial (AGENDA...)")
+        sheet = st.selectbox(
+            "Hoja de parrilla", options=_options, index=_default_idx,
+            format_func=lambda s: f"{s} — semana normal" if _is_normal_week_sheet(s) else s,
+            help="Hoja de evento especial (AGENDA…) o B2B para dibujar la semana normal")
+
+        if _is_normal_week_sheet(sheet):
+            st.caption("🗓 **Semana normal.** Se dibuja la foto del GD tal cual: "
+                       "sin canceladas ni reasignación de rampas. Las especiales "
+                       "se marcan en amarillo.")
 
         # Detect embedded bloques sheet for the selected event
         _embedded_bloques_sheet = _detect_bloques_sheet(_wb_tmp, sheet)
@@ -472,6 +509,112 @@ def show_log(r, expanded=False):
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
+
+def _detect_gd_sheet(gd_path: Path) -> str:
+    """
+    Nombre de la hoja del GD. El export de DXC la llama 'ag-grid'; el GD que
+    genera process_parrilla.py la llama 'Hoja1'. Se coge la primera que tenga
+    la columna de descripción.
+    """
+    try:
+        import openpyxl as _opx
+        _wb = _opx.load_workbook(str(gd_path), read_only=True)
+        for _sh in _wb.sheetnames:
+            _hdr = next(_wb[_sh].iter_rows(values_only=True, max_row=1), ())
+            _up = [str(h or "").strip().upper() for h in _hdr]
+            if any("DESCRIPCI" in h and "DESTINO" in h for h in _up):
+                return _sh
+        return _wb.sheetnames[0]
+    except Exception:
+        return "Hoja1"
+
+
+# ── Incidencias de nomenclatura de bloques ───────────────────────────────────
+_INC_FIELDS = ["descripcion", "grupo", "bloque_desc", "bloque_grupo",
+               "propuesto", "pestana", "arbitro", "seguro", "filas"]
+
+def _parse_incidencias(log_lines) -> list:
+    """Extrae las líneas INCIDENCIA|… que emite sorter_map_por_dia.py."""
+    out = []
+    for line in log_lines or []:
+        if not line.startswith("INCIDENCIA|"):
+            continue
+        parts = line.split("|")[1:]
+        if len(parts) < len(_INC_FIELDS):
+            continue
+        d = dict(zip(_INC_FIELDS, parts))
+        d["seguro"] = str(d["seguro"]).strip().lower() == "true"
+        out.append(d)
+    return out
+
+
+def _incidencias_csv(incs: list) -> bytes:
+    import csv, io
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=";")
+    w.writerow(["DESCRIPCION EN DXC", "GRUPO DE DESTINOS", "DICE LA DESCRIPCION",
+                "DICE EL GRUPO", "BLOQUE APLICADO", "PESTANA", "ARBITRO", "FILAS GD"])
+    for d in incs:
+        w.writerow([d["descripcion"], d["grupo"], d["bloque_desc"], d["bloque_grupo"],
+                    d["propuesto"], d["pestana"], d["arbitro"], d["filas"]])
+    return buf.getvalue().encode("utf-8-sig")
+
+
+def _render_incidencias_body(incs: list):
+    _n_sin = sum(1 for d in incs if not d["seguro"])
+    st.markdown(
+        "Estos grupos de DXC tienen el **prefijo numérico y la letra de turno "
+        "descuadrados** — los dos deberían decir lo mismo (1=D, 2=L, 3=M, 4=X, "
+        "5=J, 6=V), así que uno está mal escrito.\n\n"
+        "El mapa se ha dibujado igualmente usando la columna **Grupo de "
+        "destinos** como árbitro. No afecta a la operativa: el sorter funciona "
+        "con el destino, no con el nombre. Pero conviene corregirlo en DXC."
+    )
+    if _n_sin:
+        st.warning(f"{_n_sin} caso(s) **sin árbitro**: el código de grupo está "
+                   f"roto igual que la descripción. Revísalos a mano.")
+    try:
+        import pandas as _pd
+        _df = _pd.DataFrame([{
+            "Descripción en DXC": d["descripcion"],
+            "Grupo": d["grupo"],
+            "Dice la descripción": d["bloque_desc"],
+            "Dice el grupo": d["bloque_grupo"],
+            "Bloque aplicado": d["propuesto"],
+            "Pestaña": d["pestana"],
+            "Árbitro": d["arbitro"],
+            "Filas GD": d["filas"],
+        } for d in incs])
+        st.dataframe(_df, use_container_width=True, hide_index=True)
+    except Exception:
+        for d in incs:
+            st.text(f"{d['descripcion']} → {d['propuesto']} ({d['arbitro']})")
+    st.download_button("⬇️ Descargar listado para corregir en DXC",
+                       data=_incidencias_csv(incs),
+                       file_name="bloques_incoherentes_DXC.csv",
+                       mime="text/csv", use_container_width=True,
+                       key="dl_incidencias")
+
+
+def show_incidencias(incs: list):
+    """Popup con las incidencias. Si st.dialog no existe, cae a un expander."""
+    if not incs:
+        return
+    _title = f"⚠️ {len(incs)} bloque(s) con nomenclatura incoherente en DXC"
+    _dialog = getattr(st, "dialog", None) or getattr(st, "experimental_dialog", None)
+    if _dialog is not None and not st.session_state.get("_inc_dismissed"):
+        @_dialog(_title, width="large")
+        def _dlg():
+            _render_incidencias_body(incs)
+            if st.button("Entendido, cerrar", type="primary",
+                         use_container_width=True, key="inc_close"):
+                st.session_state["_inc_dismissed"] = True
+                st.rerun()
+        _dlg()
+    else:
+        with st.expander(_title, expanded=True):
+            _render_incidencias_body(incs)
+
 # ── Action buttons — new flow: Sort Map first, then GD ───────────────────────
 st.markdown("### Acciones")
 
@@ -481,7 +624,9 @@ _bloques_available = bool(f_bloques or _embedded_bloques_sheet)
 base_ok      = bool(f_parrilla and f_gd and f_cap)
 vis_ok       = bool(base_ok and _bloques_available)
 sortmap_done = bool(st.session_state.get("r3_map"))
-gd_ok        = bool(sortmap_done and base_ok)
+_normal_week = _is_normal_week_sheet(sheet)
+# En semana normal no se genera GD: la configuración de DXC ya es la vigente.
+gd_ok        = bool(sortmap_done and base_ok and not _normal_week)
 
 b1, b2, b3 = st.columns(3)
 with b1:
@@ -491,6 +636,8 @@ with b1:
                  disabled=not vis_ok, use_container_width=True):
         st.session_state["r3_map"] = None
         st.session_state["r3_gd_bytes"] = None
+        st.session_state["r3_incidencias"] = None
+        st.session_state["_inc_dismissed"] = False
         st.session_state["_run3"] = True
     if not vis_ok:
         if not base_ok:
@@ -507,7 +654,9 @@ with b2:
             st.session_state[k] = None
         st.session_state["_run1"] = True
     if not gd_ok:
-        if not base_ok:
+        if _normal_week:
+            st.caption("_No aplica en semana normal: el GD de DXC ya es el vigente_")
+        elif not base_ok:
             st.caption("_Sube parrilla, GD y capacidad_")
         elif not sortmap_done:
             st.caption("_Genera el Sort Map primero_")
@@ -606,7 +755,15 @@ if st.session_state.get("_run3"):
         p   = save_uploads(tmp)
         _filtered_bytes = st.session_state.get("r1_gd_filtered_bytes")
         _filter_days    = st.session_state.get("r1_day_filter")
-        if _filtered_bytes:
+        _normal_mode    = _is_normal_week_sheet(sheet)
+        if _normal_mode:
+            # Semana normal: la configuración vigente de DXC ya es la buena.
+            # No se genera GD nuevo — se dibuja el que ha subido el usuario.
+            gd = p["gd"]
+            r0_ok = True
+            st.info("Semana normal: se dibuja el GD de DXC tal cual, "
+                    "sin reasignar rampas.")
+        elif _filtered_bytes:
             gd = tmp / f"GD_{sc}_filtered.xlsx"
             gd.write_bytes(_filtered_bytes)
             r0_ok = True
@@ -619,17 +776,22 @@ if st.session_state.get("_run3"):
                 st.error("Error generando GD base.")
                 show_log(r0, expanded=True)
         if r0_ok:
-            st.session_state["r3_gd_bytes"] = gd.read_bytes()
+            if not _normal_mode:
+                st.session_state["r3_gd_bytes"] = gd.read_bytes()
             out = tmp / f"sorter_map_{sc}.xlsx"
+            # En semana normal el GD de DXC trae la hoja 'ag-grid'; en semana
+            # especial el GD lo genera process_parrilla.py con hoja 'Hoja1'.
+            _gd_sheet = _detect_gd_sheet(gd) if _normal_mode else "Hoja1"
             with st.spinner("Generando Sorter Map…"):
                 _sorter_cmd = [
                     sys.executable, str(BASE_DIR / "sorter_map_por_dia.py"),
-                    str(p["cap"]), str(gd), str(p["bloques"]), str(out), "Hoja1",
+                    str(p["cap"]), str(gd), str(p["bloques"]), str(out), _gd_sheet,
                 ]
                 if "parrilla" in p and "gd" in p:
                     _sorter_cmd += [str(p["parrilla"]), sheet.strip(), str(p["gd"])]
                 r = subprocess.run(_sorter_cmd, capture_output=True, text=True, timeout=180)
-            show_log(r)
+            _lines = show_log(r)
+            st.session_state["r3_incidencias"] = _parse_incidencias(_lines)
             if r.returncode == 0 and out.exists():
                 st.session_state["r3_map"] = (out.name, out.read_bytes())
             else:
@@ -753,7 +915,13 @@ if st.session_state["r3_map"] is not None:
     st.success("✓ Sorter Map generado")
     st.download_button("⬇️ Sorter Map.xlsx", data=data, file_name=name,
                        mime=XLSX_MIME, use_container_width=True)
-    st.caption("Hojas: DOM · LUN · MAR · MIÉ · JUE · VIE · SÁB · LEYENDA")
+    _hojas = "DOM · LUN · MAR · MIÉ · JUE · VIE · SÁB · PLAYAS_POR_RAMPA · LEYENDA"
+    if st.session_state.get("r3_incidencias"):
+        _hojas += " · ⚠️ INCIDENCIAS"
+    st.caption(f"Hojas: {_hojas}")
+
+    # Popup de incidencias de nomenclatura de bloques en DXC
+    show_incidencias(st.session_state.get("r3_incidencias") or [])
 
 st.divider()
-st.caption("v0.09 · VDL B2B · Estrictamente confidencial")
+st.caption("v0.10 · VDL B2B · Estrictamente confidencial")
