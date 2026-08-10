@@ -1,5 +1,18 @@
-# Version: 0.05
+# Version: 0.06
 # sorter_map_excel_por_dia.py
+# ---------------------------------------------------------
+# NOVEDADES v0.06
+#   * MODO SEMANA NORMAL: si la hoja de parrilla es una hoja base
+#     (B2B), no hay canceladas ni reasignación: se dibuja la foto del
+#     GD tal cual, una pestaña por letra de TURNO_REPARTO.
+#     Las ESPECIAL DIA / ESPECIAL DIA+CUTOFF se pintan en amarillo
+#     como una playa más.
+#   * SOBRECAPACIDAD: las posiciones que superan la capacidad declarada
+#     en ramp_capacity.csv ya no se descartan — se pintan en naranja.
+#   * INCIDENCIAS DE NOMENCLATURA: detecta bloques cuyo prefijo y letra
+#     no concuerdan (3BLOJ1, 5BLOX3...) usando "Grupo de destinos" como
+#     árbitro. Se emiten por stdout como INCIDENCIA|... y se vuelcan en
+#     la pestaña "⚠️ INCIDENCIAS".
 # ---------------------------------------------------------
 # Genera un Excel "Sorter Map" en formato slots:
 # - 1 pestaña por día (DOMINGO..SABADO)
@@ -167,6 +180,160 @@ def load_grupo_destinos(path: Path, sheet: str) -> pd.DataFrame:
     return standardize_columns(df)
 
 
+# -----------------------------
+# Nomenclatura de bloques: prefijo numérico ↔ letra de turno
+# -----------------------------
+LETRA_DIA = {"D": "DOMINGO", "L": "LUNES", "M": "MARTES", "X": "MIERCOLES",
+             "J": "JUEVES",  "V": "VIERNES", "S": "SABADO"}
+NUM_LETRA = {"1": "D", "2": "L", "3": "M", "4": "X", "5": "J", "6": "V", "7": "S"}
+
+_DESC_BLOQUE_RE = re.compile(r"^\[?B2B\]?\s*(\d)BLO([DLMXJVS])(\d+)_", re.IGNORECASE)
+_GRUPO_BLOQUE_RE = re.compile(r"^(\d)B([DLMXJVS])(\d+)", re.IGNORECASE)
+
+# Hojas de la parrilla que representan la semana normal (no un evento especial)
+BASE_SHEETS = {"B2B", "B2C", "BLOQUES", "RESUMEN BLOQUES", "VOLUMENES", "APY", "TEST"}
+
+
+def detect_nomenclature_issues(grupo_df: pd.DataFrame) -> List[dict]:
+    """
+    Detecta descripciones de GD cuyo prefijo numérico y letra de turno no
+    concuerdan (p.ej. 3BLOJ1: el 3 dice martes, la J dice jueves).
+
+    Árbitro: la columna 'Grupo de destinos', que también codifica el bloque
+    ('5BJ1BCR1TS' → 5BLOJ1). Si el grupo es coherente consigo mismo, manda.
+    Si el grupo también está roto, se marca como SIN ÁRBITRO.
+
+    Devuelve una lista de dicts, uno por descripción afectada.
+    """
+    desc_col = find_col(grupo_df, ["Descripción Grupos de destino",
+                                   "Descripcion Grupos de destino",
+                                   "DESCRIPCION GRUPOS DE DESTINO"])
+    grp_col = find_col(grupo_df, ["Grupo de destinos", "GRUPO DE DESTINOS",
+                                  "Grupo destinos"])
+    if not desc_col:
+        return []
+
+    seen: Dict[Tuple[str, str], dict] = {}
+    for _, r in grupo_df.iterrows():
+        desc = str(r[desc_col] or "").strip()
+        grupo = str(r[grp_col] or "").strip() if grp_col else ""
+        m = _DESC_BLOQUE_RE.match(desc)
+        if not m:
+            continue
+        pre, letra, num = m.group(1), m.group(2).upper(), m.group(3)
+        desc_ok = NUM_LETRA.get(pre) == letra
+
+        gm = _GRUPO_BLOQUE_RE.match(grupo) if grupo else None
+        g_pre, g_letra, g_num = (gm.group(1), gm.group(2).upper(), gm.group(3)) if gm else (None, None, None)
+        grupo_ok = bool(gm) and NUM_LETRA.get(g_pre) == g_letra
+        mismatch = bool(gm) and (g_pre, g_letra, g_num) != (pre, letra, num)
+
+        if desc_ok and not mismatch:
+            continue  # todo en orden
+
+        # Resolver el bloque bueno
+        if grupo_ok:
+            propuesto = f"{g_pre}BLO{g_letra}{g_num}"
+            arbitro = f"grupo {grupo}"
+            seguro = True
+        elif desc_ok:
+            propuesto = f"{pre}BLO{letra}{num}"
+            arbitro = "la propia descripción es coherente"
+            seguro = True
+        else:
+            # Ni la descripción ni el grupo son coherentes → sin árbitro.
+            # Se asume la letra (es la que usa el sorter para el turno).
+            propuesto = f"{NUM_LETRA_INV.get(letra, pre)}BLO{letra}{num}"
+            arbitro = "SIN ÁRBITRO — se asume la letra del turno"
+            seguro = False
+
+        key = (desc, grupo)
+        if key in seen:
+            seen[key]["filas"] += 1
+            continue
+        seen[key] = {
+            "descripcion": desc,
+            "grupo": grupo,
+            "bloque_desc": f"{pre}BLO{letra}{num}",
+            "bloque_grupo": f"{g_pre}BLO{g_letra}{g_num}" if gm else "(no parsea)",
+            "propuesto": propuesto,
+            "pestana": LETRA_DIA.get(propuesto[4], "?"),
+            "arbitro": arbitro,
+            "seguro": seguro,
+            "filas": 1,
+        }
+    return sorted(seen.values(), key=lambda d: (not d["seguro"], d["descripcion"]))
+
+
+NUM_LETRA_INV = {v: k for k, v in NUM_LETRA.items()}
+
+
+def load_semana_normal(par_path: str, sheet: str) -> dict:
+    """
+    Lee una hoja base de la parrilla (B2B) para el modo SEMANA NORMAL.
+
+    No hay canceladas ni reasignación de rampas: la configuración del GD ya es
+    la buena. Solo necesitamos saber qué playas hay que marcar en amarillo.
+
+    Devuelve:
+      {'especiales': {PLAYA_UPPER: (tipo, bloque, dia_salida)},
+       'turno_por_playa': {PLAYA_UPPER: 'DOMINGO'...},
+       'irregulares': [playa...],
+       'n_filas': int}
+    """
+    from openpyxl import load_workbook as _lwb
+
+    out = {"especiales": {}, "turno_por_playa": {}, "irregulares": [], "n_filas": 0}
+    wb = _lwb(par_path, read_only=True, data_only=True)
+    if sheet not in wb.sheetnames:
+        return out
+    rows = list(wb[sheet].iter_rows(values_only=True))
+    if not rows:
+        return out
+    hdr = {str(h or "").strip().upper(): i for i, h in enumerate(rows[0]) if h}
+
+    def g(row, col):
+        i = hdr.get(col)
+        if i is None or i >= len(row) or row[i] is None:
+            return ""
+        s = str(row[i]).strip()
+        return "" if s.startswith("=") or s == "#N/A" else s
+
+    for r in rows[1:]:
+        if not any(x is not None for x in r):
+            continue
+        dia_playa = g(r, "DIA_PLAYA")
+        if not dia_playa:
+            continue
+        m = re.match(r"^(?:DOMINGO|LUNES|MARTES|MIERCOLES|MI\u00c9RCOLES|JUEVES|VIERNES|SABADO|IRREGULAR)_(.+)$",
+                     dia_playa, re.IGNORECASE)
+        playa = (m.group(1) if m else dia_playa).strip().upper()
+        tipo = g(r, "TIPO_SALIDA").upper()
+        bloque = g(r, "BLOQUE")
+        # TURNO_REPARTO puede llevar prefijo K (KD1, KX4...) — se ignora la K
+        turno = g(r, "TURNO_REPARTO").upper().lstrip("K")
+
+        out["n_filas"] += 1
+
+        if tipo == "IRREGULAR" or bloque in ("--", "") or turno.startswith("I"):
+            out["irregulares"].append(playa)
+            continue
+
+        letra = ""
+        bm = re.match(r"^(\d)BLO([DLMXJVS])(\d+)$", bloque.upper())
+        if bm:
+            letra = bm.group(2)
+        elif turno:
+            letra = turno[:1]
+        if letra in LETRA_DIA:
+            out["turno_por_playa"][playa] = LETRA_DIA[letra]
+
+        if "ESPECIAL" in tipo:
+            out["especiales"][playa] = (tipo, bloque, g(r, "DIA_SALIDA").upper())
+
+    return out
+
+
 def load_bloques_horarios(path: Path) -> pd.DataFrame:
     """
     Load block timing data. Supports two formats:
@@ -297,6 +464,7 @@ _INDEX_COLORS = [
 
 MANGO_ESP  = "F5C518"   # especial — amarillo ejecutivo (texto oscuro)
 MANGO_CONF = "CC1414"   # conflicto real — rojo (solo solapamientos temporales)
+MANGO_OVER = "E8791E"   # sobrecapacidad — naranja (posición > ramp_capacity.csv)
 
 PALETTE     = [bg for bg, _ in _INDEX_COLORS]   # legacy reference
 PALETTE_ESP = [MANGO_ESP] * 10
@@ -529,9 +697,10 @@ def write_day_sheet(
     canceladas_dia=None,      # list of playa names cancelled on this day
     especiales_salientes=None, # list of (playa, dia_new, bloque) leaving this day
     salidas_extra=None,        # list of (playa, bloque) ESPECIAL SALIDA EXTRA on this day
+    grid_max_pos=None,         # ancho de rejilla global (incluye sobrecapacidad)
 ):
     subramps = sorted(cap_map.keys(), key=ramp_sort_key)
-    max_pos = max(cap_map.values()) if cap_map else 14
+    max_pos = grid_max_pos or (max(cap_map.values()) if cap_map else 14)
 
     # ── Title row — Mango: black bg, white text, no bold ─────────────────────
     ws["A1"].font = Font(bold=False, size=11, color=MANGO_WHITE,
@@ -640,6 +809,8 @@ def write_day_sheet(
         # Row fill for empty base grid cells (alternating)
         _row_fill = PatternFill("solid", fgColor=_row_bg)
         for _pc in range(1, max_pos + 1):
+            if _pc > cap:
+                continue  # fuera de capacidad declarada: se deja el gris
             _base_c = ws.cell(row=row, column=1 + _pc)
             if not _base_c.value:
                 _base_c.fill = _row_fill
@@ -656,10 +827,43 @@ def write_day_sheet(
         sub_conflicts = conflict_slots.get(sub, set())
 
         for slot, blocks_here in sorted(slot_blocks.get(sub, {}).items(), key=lambda x: x[0]):
-            if slot > cap:
+            if slot > max_pos:
                 continue
+            # Sobrecapacidad: la posición existe en el GD pero supera la
+            # capacidad declarada en ramp_capacity.csv. Antes se descartaba en
+            # silencio; ahora se pinta en naranja y se anota.
+            _is_over = slot > cap
             cell = ws.cell(row=row, column=1 + slot)
             blocks_sorted = sorted(blocks_here)
+
+            if _is_over:
+                cell.fill = PatternFill("solid", fgColor=MANGO_OVER)
+                cell.value = "+".join(blocks_sorted) if len(blocks_sorted) <= 2 \
+                             else blocks_sorted[0] + f"+{len(blocks_sorted)-1}"
+                cell.font = Font(bold=False, size=8, color=MANGO_WHITE,
+                                 name="Aptos Display")
+                cell.alignment = center
+                cell.border = border
+                multi_details.append(
+                    f"pos {slot:02d}: SOBRECAPACIDAD ({cap} declaradas) "
+                    + "+".join(blocks_sorted))
+                _ov_playas = set()
+                if playa_by_block:
+                    for _bt in blocks_sorted:
+                        for _item in playa_by_block.get(_bt, {}).get(sub, {}).get(slot, set()):
+                            _ov_playas.add(_item[1] if isinstance(_item, tuple) else _item)
+                _ov_esp = slot in esp_sub_slots.get(sub, set())
+                if _ov_esp:
+                    # También es especial: el naranja manda (la sobrecapacidad
+                    # es más urgente), pero se deja constancia.
+                    cell.value = "!" + str(cell.value)
+                    multi_details[-1] += "  [ESPECIAL]"
+                cell.comment = Comment(
+                    f"SOBRECAPACIDAD\nPosición {slot:02d} > capacidad declarada ({cap})\n"
+                    + ("ESPECIAL\n" if _ov_esp else "")
+                    + ("Playas: " + ", ".join(sorted(_ov_playas)) if _ov_playas else ""),
+                    "sorter_map")
+                continue
 
             if slot in sub_conflicts:
                 # Real timing conflict → Mango red
@@ -1499,11 +1703,59 @@ def write_validation_sheet(ws, grupo_df, cap_map, block_intervals,
     ws.freeze_panes = "A3"
 
 def main():
-    print("=== Generador SORTER_MAP Excel v0.05 (formato S26+) ===")
+    print("=== Generador SORTER_MAP Excel v0.06 (formato S26+) ===")
 
     cap_map = load_capacity(CAPACITY_CSV)
     grupo = load_grupo_destinos(GRUPO_XLSX, GRUPO_SHEET)
     bloques = load_bloques_horarios(BLOQUES_XLSX)
+
+    # ── ¿Semana normal? La hoja de parrilla (argv[7]) decide el modo ──────────
+    _sheet_arg_mode = _sys.argv[7] if len(_sys.argv) > 7 else None
+    MODO_NORMAL = bool(_sheet_arg_mode
+                       and _sheet_arg_mode.strip().upper() in BASE_SHEETS)
+    if MODO_NORMAL:
+        print(f"  Modo SEMANA NORMAL (hoja '{_sheet_arg_mode}'): "
+              f"foto del GD, sin reasignación de rampas.")
+    else:
+        print("  Modo SEMANA ESPECIAL.")
+
+    # ── Incidencias de nomenclatura de bloques ───────────────────────────────
+    _incidencias = detect_nomenclature_issues(grupo)
+    if _incidencias:
+        print(f"⚠️ {len(_incidencias)} bloque(s) con nomenclatura incoherente "
+              f"(prefijo ≠ letra de turno):")
+        for _inc in _incidencias:
+            print("INCIDENCIA|{descripcion}|{grupo}|{bloque_desc}|{bloque_grupo}"
+                  "|{propuesto}|{pestana}|{arbitro}|{seguro}|{filas}".format(**_inc))
+            print(f"   · {_inc['descripcion']}  →  {_inc['propuesto']} "
+                  f"(pestaña {_inc['pestana']}; {_inc['arbitro']})")
+    else:
+        print("  Nomenclatura de bloques: sin incidencias.")
+
+    # ── Ancho de rejilla: la capacidad declarada manda, pero si el GD usa
+    #    posiciones por encima hay que poder dibujarlas (en naranja) ──────────
+    _obs_max = 0
+    try:
+        _ecol = find_col(grupo, ["Elemento", "ELEMENTO"])
+        _zcol = find_col(grupo, ["Tipo de zona", "TIPO DE ZONA", "TIPO_ZONA", "TIPO ZONA"])
+        for _, _rr in grupo.iterrows():
+            if _zcol and str(_rr[_zcol]).strip().upper() != "POSTEX":
+                continue
+            _s, _sl = parse_subramp_and_slot_from_elemento(_rr[_ecol])
+            if _s is None or _sl is None:
+                continue
+            if any(_s.startswith(_p) for _p in EXCLUDE_PREFIXES):
+                continue
+            if _s in cap_map:
+                _obs_max = max(_obs_max, _sl)
+    except Exception:
+        pass
+    _cap_max = max(cap_map.values()) if cap_map else 14
+    GRID_MAX_POS = max(_cap_max, _obs_max)
+    if _obs_max > _cap_max:
+        print(f"⚠️ Sobrecapacidad: el GD usa hasta la posición {_obs_max} y "
+              f"ramp_capacity.csv declara como máximo {_cap_max}. "
+              f"Se pintarán en naranja.")
 
     wb = Workbook()
     wb.remove(wb.active)
@@ -1560,7 +1812,29 @@ def main():
                     _playa_has_sorter[_pu] = True
         except Exception as _e_sor:
             pass  # playa_has_sorter stays empty, fall back to parrilla zona
-    if _par_path:
+    # ── MODO SEMANA NORMAL ────────────────────────────────────────────────────
+    # No hay canceladas, ni especiales que cambian de día, ni reasignación.
+    # Solo hace falta saber qué playas llevan marca amarilla.
+    _normal_esp_playas: set = set()
+    _normal_esp_pairs: set = set()   # {(block_token, PLAYA)} — p.ej. ('X3','IRLANDA')
+    _normal_info: dict = {}
+    if MODO_NORMAL and _par_path:
+        try:
+            _normal_info = load_semana_normal(_par_path, _sheet_arg_mode)
+            _normal_esp_playas = {p.upper() for p in _normal_info["especiales"]}
+            for _p, (_t, _b, _ds) in _normal_info["especiales"].items():
+                _bm = re.match(r"^\d?BLO([DLMXJVS])(\d+)$", str(_b).upper())
+                if _bm:
+                    _normal_esp_pairs.add((_bm.group(1) + _bm.group(2), _p.upper()))
+            print(f"  Hoja '{_sheet_arg_mode}': {_normal_info['n_filas']} filas · "
+                  f"{len(_normal_info['irregulares'])} irregulares (fuera del mapa) · "
+                  f"{len(_normal_esp_playas)} especiales (se marcan en amarillo).")
+            for _p, (_t, _b, _ds) in sorted(_normal_info["especiales"].items()):
+                print(f"   · {_p}  [{_t}]  bloque {_b}  salida {_ds}")
+        except Exception as _ex_norm:
+            print(f"  Aviso: no se pudo leer la hoja base '{_sheet_arg_mode}': {_ex_norm}")
+
+    if _par_path and not MODO_NORMAL:
         try:
             import re as _re_ss
             from openpyxl import load_workbook as _lwb_e2
@@ -1709,6 +1983,23 @@ def main():
         usage_by_block, warnings, especial_by_block, playa_by_block = compute_day_usage(grupo, day_blocks, block_intervals)
         total_warnings += warnings
 
+        # ── MODO NORMAL: marcar en amarillo las ESPECIAL DIA / DIA+CUTOFF ─────
+        # Ya tienen su bloque y sus rampas en el GD: no se reasigna nada, solo
+        # se pintan para que se distingan de las regulares.
+        if MODO_NORMAL and _normal_esp_pairs:
+            for _bt, _sub_map in playa_by_block.items():
+                if _bt.startswith("_CONFLICT_"):
+                    continue
+                for _sub, _slot_map in _sub_map.items():
+                    for _sl, _items in _slot_map.items():
+                        for _item in _items:
+                            _pname = (_item[1] if isinstance(_item, tuple) else _item).upper()
+                            # La misma playa puede salir varios días: solo se
+                            # marca en el bloque concreto que es especial.
+                            if (_bt.upper(), _pname) in _normal_esp_pairs:
+                                especial_by_block[_bt][_sub].add(_sl)
+                                break
+
         # ── Inject SALIDA EXTRA positions into especial_by_block so they paint yellow ──
         _extras_this_day = _salidas_extra_por_dia.get(day_name, [])
         if _extras_this_day:
@@ -1748,6 +2039,7 @@ def main():
             canceladas_dia=_canceladas_por_dia.get(day_name, []),
             especiales_salientes=_especiales_por_dia_orig.get(day_name, []),
             salidas_extra=_salidas_extra_por_dia.get(day_name, []),
+            grid_max_pos=GRID_MAX_POS,
         )
 
         # Collect data for PLAYAS_POR_RAMPA sheet
@@ -1787,6 +2079,41 @@ def main():
 
     ws_leg = wb.create_sheet("LEYENDA")
     write_leyenda_sheet(ws_leg, global_color_map, bold, title_font, center, border)
+
+    # ── Pestaña de incidencias de nomenclatura ────────────────────────────────
+    if _incidencias:
+        ws_inc = wb.create_sheet("⚠️ INCIDENCIAS")
+        ws_inc["A1"] = ("Bloques con nomenclatura incoherente en DXC — "
+                        "el prefijo numérico y la letra de turno no concuerdan")
+        ws_inc["A1"].font = Font(bold=False, size=11, color=MANGO_WHITE, name="Aptos Display")
+        ws_inc["A1"].fill = PatternFill("solid", fgColor=MANGO_BLACK)
+        ws_inc.merge_cells(start_row=1, start_column=1, end_row=1, end_column=8)
+        ws_inc.row_dimensions[1].height = 26
+
+        _hdrs = ["DESCRIPCIÓN EN DXC", "GRUPO DE DESTINOS", "DICE LA DESCRIPCIÓN",
+                 "DICE EL GRUPO", "BLOQUE APLICADO", "PESTAÑA", "ÁRBITRO", "FILAS GD"]
+        for _ci, _h in enumerate(_hdrs, start=1):
+            _c = ws_inc.cell(row=2, column=_ci, value=_h)
+            _c.font = Font(bold=False, size=9, color=MANGO_MUTED, name="Aptos Display")
+            _c.fill = PatternFill("solid", fgColor="F0F0F0")
+            _c.alignment = center
+            _c.border = border
+
+        for _ri, _inc in enumerate(_incidencias, start=3):
+            _vals = [_inc["descripcion"], _inc["grupo"], _inc["bloque_desc"],
+                     _inc["bloque_grupo"], _inc["propuesto"], _inc["pestana"],
+                     _inc["arbitro"], _inc["filas"]]
+            for _ci, _v in enumerate(_vals, start=1):
+                _c = ws_inc.cell(row=_ri, column=_ci, value=_v)
+                _c.font = Font(bold=False, size=9, name="Aptos Display")
+                _c.border = border
+                _c.alignment = Alignment(horizontal="left", vertical="center")
+                if not _inc["seguro"]:
+                    _c.fill = PatternFill("solid", fgColor="FFF2CC")
+
+        for _col, _w in zip("ABCDEFGH", [52, 16, 19, 15, 16, 12, 42, 10]):
+            ws_inc.column_dimensions[_col].width = _w
+        ws_inc.freeze_panes = "A3"
 
     ws_tbl = wb.create_sheet("BLOQUES_DESTINOS")
     all_block_tokens = [f"{code}{i}" for _, code in DAY_SHEETS for i in range(10)]
