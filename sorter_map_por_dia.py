@@ -844,14 +844,15 @@ def write_day_sheet(
                                  name="Aptos Display")
                 cell.alignment = center
                 cell.border = border
-                multi_details.append(
-                    f"pos {slot:02d}: SOBRECAPACIDAD ({cap} declaradas) "
-                    + "+".join(blocks_sorted))
                 _ov_playas = set()
                 if playa_by_block:
                     for _bt in blocks_sorted:
                         for _item in playa_by_block.get(_bt, {}).get(sub, {}).get(slot, set()):
                             _ov_playas.add(_item[1] if isinstance(_item, tuple) else _item)
+                _ov_playas_str = " · ".join(sorted(_ov_playas)) if _ov_playas else "playa desconocida"
+                multi_details.append(
+                    f"pos {slot:02d}: SOBRECAPACIDAD ({cap} declaradas) "
+                    + "+".join(blocks_sorted) + f"  →  {_ov_playas_str}")
                 _ov_esp = slot in esp_sub_slots.get(sub, set())
                 if _ov_esp:
                     # También es especial: el naranja manda (la sobrecapacidad
@@ -1106,6 +1107,17 @@ def write_day_sheet(
                         f"{sub}[{','.join(str(s) for s in sorted(slots))}]"
                         for sub, slots in sorted(by_sub.items(), key=lambda x: ramp_sort_key(x[0]))
                     )
+                    # Destino disperso: cuando la baja capacidad de las subrampas
+                    # obliga a repartir un mismo destino entre muchas subrampas
+                    # distintas (ej. ESPANA_LAS_PALMAS), se avisa en la propia
+                    # celda de POSICIONES/ESTADO — no es un error, es información
+                    # operativa útil para quien sube la config a DXC.
+                    _DISPERSION_THRESHOLD = 4  # nº de subrampas distintas a partir del cual se avisa
+                    if len(by_sub) >= _DISPERSION_THRESHOLD:
+                        pos_str += (
+                            f"  ⚠ DISPERSO en {len(by_sub)} subrampas "
+                            "— destino disperso por la poca capacidad de rampas"
+                        )
                     # Check if this playa is cancelled in the semana especial sheet.
                     # BUT a playa can be cancelled on one day and run as an active
                     # especial on another (e.g. BENAVENTE_TSA: cancelled Wed, especial
@@ -1115,6 +1127,7 @@ def write_day_sheet(
                     _is_cancelled = (cancelled_esp is not None
                                      and playa.upper() in cancelled_esp
                                      and not _has_positions)
+                    _is_disperso = len(by_sub) >= _DISPERSION_THRESHOLD and not _is_cancelled
                     vals = [dia_display, playa, bt,
                             "⚠ CANCELADA — REVISAR" if _is_cancelled else pos_str]
                     alns = [_center, _left, _center, _wrap]
@@ -1136,6 +1149,8 @@ def write_day_sheet(
                             c.font = _F2(size=9, bold=False, color="1A1A1A")
                         elif ci == SC+1:
                             c.font = _F2(size=8, bold=False, color="1A1A1A")
+                        elif ci == SC+3 and _is_disperso:
+                            c.font = _F2(size=8, bold=True, color="CC4400")
                         else:
                             c.font = _F2(size=8, color="666666")
                     ws.row_dimensions[sr].height = 22
