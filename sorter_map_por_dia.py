@@ -1,6 +1,33 @@
-# Version: 0.06
+# Version: 0.07
 # sorter_map_excel_por_dia.py
 # ---------------------------------------------------------
+# NOVEDADES v0.07
+#   * SOBRECAPACIDAD: la nota visible (no solo el comentario oculto) incluye
+#     ahora el/los destino(s) implicados, no solo el bloque.
+#   * DESTINO DISPERSO: aviso cuando un especial se reparte en 4+ subrampas
+#     distintas (baja capacidad de rampas obliga a fragmentarlo).
+#   * CONFLICTO DE POSICIÓN — REGLA ÚNICA: los dos mecanismos de detección
+#     de "varios ocupantes en una celda" (conflicto de bloques por
+#     solapamiento horario, y conflicto de destinos por mismo bloque) se
+#     consolidan en uno solo, basado en pares (bloque, destino):
+#       - Mismo bloque exacto  → mismo instante → conflicto siempre.
+#       - Bloques distintos    → conflicto solo si sus ventanas horarias
+#         se solapan; si no, es una reutilización legítima de la posición
+#         en horas distintas del día (se fusiona con leyenda, p.ej. "J1+J5").
+#     Se pinta en rojo y se anota con los destinos implicados, ordenados de
+#     mayor a menor nº de posiciones totales — el de más posiciones "se
+#     queda"; para los demás se sugiere un hueco libre (subrampas con más
+#     capacidad libre primero). Es solo una sugerencia informativa para
+#     corregir en DXC/MAR — no se reasigna nada en el Excel.
+#   * LIMITACIÓN DE v0.05 RESUELTA: compute_day_usage() tenía un mecanismo
+#     interno que, al detectar dos bloques con horario solapado en la misma
+#     posición (p.ej. M5 vs M6), descartaba en silencio uno de los dos SIN
+#     pintarlo nunca en rojo ni guardar su destino en ningún sitio — el
+#     conflicto era invisible incluso para la regla única de arriba, porque
+#     el dato del "perdedor" nunca llegaba a playa_by_block. Ahora se
+#     conserva el destino del bloque evictado (bajo la misma clave
+#     _CONFLICT_<bloque>) y se incorpora a la detección de conflictos, así
+#     que este tipo de choque real por fin se ve.
 # NOVEDADES v0.06
 #   * MODO SEMANA NORMAL: si la hoja de parrilla es una hoja base
 #     (B2B), no hay canceladas ni reasignación: se dibuja la foto del
@@ -594,6 +621,20 @@ def compute_day_usage(
                         break
                 if conflict:
                     usage[f"_CONFLICT_{block_token}"][sub].add(slot)
+                    # Record the playa here too (under the same _CONFLICT_
+                    # key) instead of discarding it — otherwise this evicted
+                    # entry becomes invisible to any conflict reporting
+                    # downstream, silently hiding a real double-booking
+                    # (e.g. two time-overlapping blocks, like M5 and M6,
+                    # both declared on the exact same physical position).
+                    _desc_str_c = str(r[desc_col])
+                    if "CANCELAD" not in _desc_str_c.upper():
+                        _playa_m_c = _re_playa.search(_desc_str_c)
+                        if _playa_m_c:
+                            _dia_desc_c = _playa_m_c.group(1).strip().upper()
+                            _playa_name_c = _playa_m_c.group(2).strip()
+                            playa_map[f"_CONFLICT_{block_token}"][sub][slot].add(
+                                (_dia_desc_c, _playa_name_c))
                     continue
 
             # Skip cancelled entries — not painted on map
@@ -747,6 +788,32 @@ def write_day_sheet(
                 else:
                     slot_blocks[sub][s].add(bt)
 
+    # Huecos libres por subrampa (dentro de la capacidad declarada, sin
+    # ningún bloque asignado ese día) — usados para sugerir dónde podría
+    # reubicarse el destino "perdedor" de un conflicto de posición. Es solo
+    # una sugerencia informativa para quien corrija DXC: esta herramienta no
+    # reasigna nada por sí misma.
+    free_by_sub: Dict[str, List[int]] = {}
+    for _sub_f in subramps:
+        _cap_f = cap_map[_sub_f]
+        _free_f = [p for p in range(1, _cap_f + 1) if p not in slot_blocks.get(_sub_f, {})]
+        if _free_f:
+            free_by_sub[_sub_f] = _free_f
+
+    def _suggest_free_slots(needed: int, exclude_sub: str = "") -> str:
+        """Sugiere hasta 2 subrampas con huecos libres para reubicar `needed`
+        posiciones. Solo texto informativo — no reserva ni asigna nada."""
+        candidates = sorted(
+            ((s, f) for s, f in free_by_sub.items() if s != exclude_sub),
+            key=lambda x: -len(x[1]))
+        picks = []
+        for s, free in candidates:
+            _shown = ",".join(str(p) for p in free[:5]) + ("…" if len(free) > 5 else "")
+            picks.append(f"{s}[{_shown}] ({len(free)} libres)")
+            if len(picks) >= 2:
+                break
+        return "; ".join(picks) if picks else "sin huecos libres detectados"
+
     # Build especial slot set for quick lookup when painting
     esp_sub_slots: Dict[str, Set[int]] = defaultdict(set)
     if especial_by_block:
@@ -766,21 +833,52 @@ def write_day_sheet(
                             playa = item[1] if isinstance(item, tuple) else item
                             slot_playas[sub][s].add(playa)
 
-    # Real conflicts: slots where the assigned blocks themselves overlap in time
+    # ── Conflicto real: una única regla para toda celda con más de un
+    #    ocupante (bloque, destino) en la misma posición física:
+    #      - Mismo bloque exacto  → mismo instante → conflicto siempre.
+    #      - Bloques distintos    → conflicto solo si sus ventanas horarias
+    #        se solapan; si no se solapan es una reutilización legítima de
+    #        la posición en horas distintas del día (se fusiona con leyenda,
+    #        p.ej. "J1+J5").
+    #    El Excel es un espejo de DXC: un conflicto no se reasigna, solo se
+    #    pinta en rojo y se anotan los destinos implicados, ordenados de
+    #    mayor a menor nº de posiciones — el de más posiciones primero.
+    slot_occupants: Dict[str, Dict[int, Set[Tuple[str, str]]]] = defaultdict(lambda: defaultdict(set))
+    _playa_total_count: Dict[str, int] = defaultdict(int)
+    if playa_by_block:
+        for bt, per_sub in playa_by_block.items():
+            # "_CONFLICT_<token>" entries are blocks that compute_day_usage()
+            # already found to time-overlap an earlier block on this exact
+            # slot (e.g. M5 vs M6) — they were evicted from the normal
+            # usage/playa bucket, but their destino is still tracked here
+            # under the same key, so we still want them as an occupant
+            # (using the real underlying block token) instead of silently
+            # dropping this real conflict, which is what happened before.
+            real_bt = bt[len("_CONFLICT_"):] if bt.startswith("_CONFLICT_") else bt
+            for sub, slot_map in per_sub.items():
+                for slot, items in slot_map.items():
+                    for item in items:
+                        playa = item[1] if isinstance(item, tuple) else item
+                        slot_occupants[sub][slot].add((real_bt, playa))
+                        _playa_total_count[playa] += 1
+
     conflict_slots: Dict[str, Set[int]] = defaultdict(set)
-    for sub, slot_map in slot_blocks.items():
-        for s, blqs in slot_map.items():
-            blqs_list = list(blqs)
-            for i in range(len(blqs_list)):
-                for j in range(i + 1, len(blqs_list)):
-                    b1, b2 = blqs_list[i], blqs_list[j]
-                    iv1 = block_intervals.get(b1) if block_intervals else None
-                    iv2 = block_intervals.get(b2) if block_intervals else None
-                    if iv1 and iv2 and blocks_overlap(iv1, iv2):
-                        conflict_slots[sub].add(s)
-                        break
-                if s in conflict_slots.get(sub, set()):
-                    break
+    conflict_detail: Dict[Tuple[str, int], Set[str]] = defaultdict(set)  # (sub,slot) → destinos en conflicto
+    for sub, slot_map in slot_occupants.items():
+        for slot, occ in slot_map.items():
+            occ_list = list(occ)
+            for i in range(len(occ_list)):
+                for j in range(i + 1, len(occ_list)):
+                    (bt1, p1), (bt2, p2) = occ_list[i], occ_list[j]
+                    if bt1 == bt2:
+                        is_conflict = p1 != p2  # mismo bloque, destino distinto
+                    else:
+                        iv1 = block_intervals.get(bt1) if block_intervals else None
+                        iv2 = block_intervals.get(bt2) if block_intervals else None
+                        is_conflict = bool(iv1 and iv2 and blocks_overlap(iv1, iv2))
+                    if is_conflict:
+                        conflict_slots[sub].add(slot)
+                        conflict_detail[(sub, slot)].update({p1, p2})
 
     row = 3
     for sub in subramps:
@@ -802,8 +900,8 @@ def write_day_sheet(
             c.border = border
             c.alignment = center
             if p > cap:
-                c.fill = PatternFill("solid", fgColor="F5F5F5")
-                c.font = Font(size=7, color="DEDEDE")
+                c.fill = PatternFill("lightUp", fgColor="BFBFBF", bgColor="FFFFFF")
+                c.font = Font(size=7, color="999999")
 
         # MULTI column base
         # Row fill for empty base grid cells (alternating)
@@ -867,11 +965,42 @@ def write_day_sheet(
                 continue
 
             if slot in sub_conflicts:
-                # Real timing conflict → Mango red
+                # Conflicto real (mismo bloque exacto, o bloques distintos con
+                # ventanas horarias solapadas) → rojo. El destino con más
+                # posiciones totales "se queda" (es el que probablemente
+                # estaba ya bien asignado); para los demás se sugiere un
+                # hueco libre — solo información para corregir en DXC/MAR,
+                # no se reasigna nada aquí.
                 cell.fill = PatternFill("solid", fgColor=MANGO_CONF)
                 cell.value = "+".join(blocks_sorted)
                 cell.font = Font(bold=False, size=8, color=MANGO_WHITE, name="Aptos Display")
-                multi_details.append(f"pos {slot:02d}: CONFLICTO " + "+".join(blocks_sorted))
+                _confl_playas = sorted(
+                    conflict_detail.get((sub, slot), set()),
+                    key=lambda p: (-_playa_total_count.get(p, 0), p))
+                _keeper = _confl_playas[0] if _confl_playas else None
+                _losers = _confl_playas[1:]
+                _confl_str = " vs ".join(
+                    f"{p} ({_playa_total_count.get(p, 0)} pos)"
+                    + (", se queda" if p == _keeper else "")
+                    for p in _confl_playas)
+                _sugg_bits = [
+                    f"{p} → {_suggest_free_slots(_playa_total_count.get(p, 0), exclude_sub=sub)}"
+                    for p in _losers]
+                _sugg_str = "; sugerencia: " + " | ".join(_sugg_bits) if _sugg_bits else ""
+                multi_details.append(
+                    f"pos {slot:02d}: CONFLICTO DE POSICIÓN (DXC) — " + _confl_str + _sugg_str)
+                cell.comment = Comment(
+                    "CONFLICTO DE POSICIÓN\n"
+                    f"Posición {slot:02d} — misma posición física, destinos "
+                    "distintos en DXC:\n"
+                    + "\n".join(f"· {p} ({_playa_total_count.get(p, 0)} posiciones totales)"
+                                + (" — se queda" if p == _keeper else "")
+                                for p in _confl_playas)
+                    + ("\n\nSugerencia de hueco libre para reubicar:\n"
+                       + "\n".join(f"· {p}: {_suggest_free_slots(_playa_total_count.get(p, 0), exclude_sub=sub)}"
+                                   for p in _losers) if _losers else "")
+                    + "\n\nNo reasignado — corregir en DXC/MAR.",
+                    "sorter_map")
             elif len(blocks_sorted) == 1:
                 b = blocks_sorted[0]
                 is_esp = slot in esp_sub_slots.get(sub, set())
@@ -934,14 +1063,19 @@ def write_day_sheet(
 
         # (evicted blocks are noted in MULTI column but don't paint cells red)
 
-        # Compact: one line per block → playa (no slot detail)
+        # Compact: one line per (bloque, destino) — con sus posiciones exactas.
+        # OJO: un mismo bloque (p.ej. M5) puede representar destinos DISTINTOS
+        # en posiciones distintas de la misma subrampa (CDO_MEXICO en 2-9,
+        # MEXICO en 10-12 — ambos M5, pero no son el mismo destino ni chocan
+        # entre sí). Antes esto se colapsaba a un solo "M5 = CDO_MEXICO" que
+        # ocultaba a MEXICO por completo y hacía parecer, al cruzarlo con la
+        # tabla CAMBIOS DE SEMANA, que dos destinos distintos compartían
+        # posición cuando en realidad no era así — solo faltaba en la nota.
         if _multi_acc:
-            _seen = {}
             for (_bt, _pl) in sorted(_multi_acc.keys()):
-                if _bt not in _seen:
-                    _pl_short = _pl[:30] + '…' if len(_pl) > 31 else _pl
-                    multi_details.append(f"{_bt} = {_pl_short}")
-                    _seen[_bt] = _pl_short
+                _pl_short = _pl[:30] + '…' if len(_pl) > 31 else _pl
+                _slots_str = ",".join(str(s) for s in sorted(_multi_acc[(_bt, _pl)]))
+                multi_details.append(f"{_bt} = {_pl_short} [{_slots_str}]")
 
         # Evicted blocks ("desplazado") removed — noise, real conflicts shown in red
         all_details = multi_details
@@ -1118,6 +1252,30 @@ def write_day_sheet(
                             f"  ⚠ DISPERSO en {len(by_sub)} subrampas "
                             "— destino disperso por la poca capacidad de rampas"
                         )
+                    # Conflicto de posición: esta playa comparte alguna posición
+                    # física con otro destino distinto dentro del mismo bloque.
+                    # Se lista ordenado de mayor a menor nº de posiciones totales
+                    # (el de más posiciones primero) — no se reasigna nada, es
+                    # un espejo de lo que hay (mal) declarado en DXC. Si esta
+                    # playa NO es la de más posiciones del conflicto (es la
+                    # "perdedora"), se añade una sugerencia de hueco libre.
+                    _confl_bits = []
+                    _my_total = _playa_total_count.get(playa, 0)
+                    for _sub_c, _slots_c in by_sub.items():
+                        for _slot_c in _slots_c:
+                            _others_c = conflict_detail.get((_sub_c, _slot_c), set()) - {playa}
+                            if _others_c:
+                                _others_sorted = sorted(
+                                    _others_c, key=lambda p: (-_playa_total_count.get(p, 0), p))
+                                _bit = f"{_sub_c}[{_slot_c}] vs " + ", ".join(_others_sorted)
+                                _is_loser = any(
+                                    _playa_total_count.get(o, 0) >= _my_total for o in _others_c)
+                                if _is_loser:
+                                    _bit += (f" — sugerencia: "
+                                             f"{_suggest_free_slots(_my_total, exclude_sub=_sub_c)}")
+                                _confl_bits.append(_bit)
+                    if _confl_bits:
+                        pos_str += "  ⚠ CONFLICTO DE POSICIÓN (DXC) — " + "; ".join(_confl_bits)
                     # Check if this playa is cancelled in the semana especial sheet.
                     # BUT a playa can be cancelled on one day and run as an active
                     # especial on another (e.g. BENAVENTE_TSA: cancelled Wed, especial
@@ -1128,11 +1286,14 @@ def write_day_sheet(
                                      and playa.upper() in cancelled_esp
                                      and not _has_positions)
                     _is_disperso = len(by_sub) >= _DISPERSION_THRESHOLD and not _is_cancelled
+                    _is_conflicto = bool(_confl_bits) and not _is_cancelled
                     vals = [dia_display, playa, bt,
                             "⚠ CANCELADA — REVISAR" if _is_cancelled else pos_str]
                     alns = [_center, _left, _center, _wrap]
                     if _is_cancelled:
                         _row_fill = _PF2("solid", fgColor="FFE0B2")  # naranja claro
+                    elif _is_conflicto:
+                        _row_fill = _PF2("solid", fgColor="FFD6D6")  # rojo claro — conflicto real
                     else:
                         _row_fill = SIDE_ESP_FILL if sr % 2 == 0 else _PF2("solid", fgColor="FFF5A0")
                     for ci, (val, aln) in enumerate(zip(vals, alns), SC):
@@ -1149,6 +1310,8 @@ def write_day_sheet(
                             c.font = _F2(size=9, bold=False, color="1A1A1A")
                         elif ci == SC+1:
                             c.font = _F2(size=8, bold=False, color="1A1A1A")
+                        elif ci == SC+3 and _is_conflicto:
+                            c.font = _F2(size=8, bold=True, color="B91C1C")
                         elif ci == SC+3 and _is_disperso:
                             c.font = _F2(size=8, bold=True, color="CC4400")
                         else:
@@ -1240,6 +1403,7 @@ def write_leyenda_sheet(ws, day_block_color_map: Dict[str, str], bold, title_fon
     ws["A11"] = "• 1 celda = 1 posición suelo (POSTEX)"
     ws["A12"] = "• Si un slot lo usan 2 bloques del mismo día -> se pinta GRIS + texto 'J1+J2'"
     ws["A13"] = "• Columna MULTI_BLOQUE indica qué posiciones están en más de un bloque"
+    ws["A14"] = "• Celda con trama rayada gris = fuera de la capacidad declarada en ramp_capacity.csv (no existe físicamente, no es un hueco libre)"
     ws.column_dimensions["A"].width = 28
     ws.column_dimensions["B"].width = 12
 
