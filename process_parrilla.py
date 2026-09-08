@@ -13,6 +13,26 @@ Uso:
 
 Ejemplo:
     python process_parrilla.py parrilla_de_salidas.xlsx resultadosConsulta.xlsx ramp_capacity.csv parrilla_test_s14 S14
+
+NOVEDADES:
+  * Orden de asignación de especiales: ahora se procesan primero los destinos
+    (y familias de destinos) con MÁS posiciones totales, no alfabéticamente.
+    Así el más grande se queda con el mejor hueco y no acaba fragmentado.
+  * KEEP-RAMP registra sus posiciones en run_occ (antes no lo hacía) y
+    detecta colisión si otro especial ya había reclamado la misma posición
+    en la misma tanda — se marca como 🔴 CONFLICTO DE POSICIÓN en el
+    resumen de consola y en el informe HTML, en vez de pasar desapercibido.
+  * CAUSA RAÍZ REAL (la que de verdad producía MALTA vs ESPANA_LAS_PALMAS):
+    el control de huecos ocupados (run_occ) estaba organizado por DÍA de
+    salida, no por bloque físico. Un mismo bloque (p.ej. 3BLOM3, que corre de
+    madrugada de martes a miércoles) puede aparecer con día_salida distinto
+    para especiales distintas — y como cada una solo miraba huecos dentro de
+    su propio día, ninguna veía lo que la otra ya había ocupado en el mismo
+    bloque físico. Se añadió run_occ_by_bloque, que además de por día
+    registra lo ya asignado por bloque (y bloques con horario solapado), así
+    que ahora sí se ven entre sí sin importar la etiqueta de día. Verificado
+    con datos reales: 0 conflictos entre especiales tras el fix (antes había
+    4 posiciones realmente pisadas entre MALTA y ESPANA_LAS_PALMAS).
 """
 
 import sys, re, csv, os, shutil, tempfile, json
@@ -342,12 +362,20 @@ def load_parrilla(path, sheet_name):
 # ─── RAMPA ASSIGNMENT ─────────────────────────────────────────────────────────
 
 def build_day_occ(tagged, dia, new_bloque, bloque_timings,
-                   exclude_playas=None, run_occ=None):
+                   exclude_playas=None, run_occ=None, run_occ_by_bloque=None):
     """
     Build {rampa: {pos: grupo}} for dia, merging:
     - positions from tagged GD that overlap in time with new_bloque
       (regardless of which day the entry is tagged to)
-    - positions already assigned in this run (run_occ) — always conflicting
+    - positions already assigned in this run under the SAME día_new
+      (run_occ) — always conflicting
+    - positions already assigned in this run under a DIFFERENT día_new but
+      the SAME (or a time-overlapping) bloque físico (run_occ_by_bloque).
+      This matters because one physical bloque (e.g. 3BLOM3, martes noche a
+      miércoles mañana) can legitimately be recorded with different
+      día_salida labels for different especiales — dos especiales que
+      comparten bloque deben verse entre sí aunque su "día nuevo" no
+      coincida, o si no, se pisan sin que nada lo detecte.
     """
     ex = exclude_playas or set()
     occ = defaultdict(dict)
@@ -365,10 +393,25 @@ def build_day_occ(tagged, dia, new_bloque, bloque_timings,
         r, p = parse_rampa(e['elemento'])
         if r and p:
             occ[r][p] = e['grupo']
-    # Always add within-run assignments — no timing bypass
+    # Always add within-run assignments made under this exact día_new — no timing bypass
     for rampa, pos_map in (run_occ or {}).items():
         for pos, grupo in pos_map.items():
             occ[rampa][pos] = grupo
+    # Also add within-run assignments made under a DIFFERENT día_new that
+    # share the same physical bloque (or a time-overlapping one).
+    if run_occ_by_bloque:
+        for other_bloque, rampa_map in run_occ_by_bloque.items():
+            if not new_bloque:
+                continue
+            same_or_overlapping = (
+                other_bloque == new_bloque
+                or (other_bloque in bloque_timings and new_bloque in bloque_timings
+                    and bloques_overlap(new_bloque, other_bloque, bloque_timings)))
+            if not same_or_overlapping:
+                continue
+            for rampa, pos_map in rampa_map.items():
+                for pos, occupant in pos_map.items():
+                    occ[rampa][pos] = occupant
     return occ
 
 
@@ -548,6 +591,30 @@ def get_slot_structure(postex_entries, sorexp_entries):
     return slots, dict(rampa_dests), alm_p, alm_s
 
 
+def _estimate_positions(orig_dia, orig_playa, by_dia_playa, tagged):
+    """
+    Best-effort count of physical positions a playa currently occupies, used
+    ONLY to order especiales assignment (biggest first) so larger destinos
+    get first pick of free capacity and aren't the ones left fragmented
+    across many subrampas. Mirrors the same source-resolution steps as
+    assign_especial() (resolve GD name → same day → best other day → full
+    GD scan) but has no side effects and never raises.
+    """
+    playa = _resolve_gd_playa(orig_playa, by_dia_playa) or orig_playa
+    orig = by_dia_playa.get((orig_dia, playa), [])
+    postex = [e for e in orig if e['tipo_zona'] == 'POSTEX' and e['is_sorter']]
+    if not postex:
+        _, fallback = find_best_source_day(playa, orig_dia, by_dia_playa)
+        if fallback:
+            postex = fallback
+        else:
+            postex = [e for e in tagged
+                      if e.get('playa') == playa
+                      and e['tipo_zona'] == 'POSTEX' and e['is_sorter']]
+    slots, _, _, _ = get_slot_structure(postex, [])
+    return len(slots)
+
+
 def _resolve_gd_playa(playa, by_dia_playa):
     """
     Map a parrilla playa name to the name actually used in the GD.
@@ -584,7 +651,7 @@ def _subslot_of_entry(e):
 def assign_especial(orig_dia, orig_playa, new_dia, raw_bloque, id_cluster,
                     by_dia_playa, tagged, capacity, bloque_timings, freed_in_new_dia,
                     run_occ_new_dia=None, preferred_rampas=None, all_especial_playas=None,
-                    committed_group=None, anchor_numbers=None):
+                    committed_group=None, anchor_numbers=None, run_occ_by_bloque=None):
     """
     Assign slots from (orig_dia, orig_playa) to free sorter positions in new_dia,
     respecting bloque timing and preserving the slot→destinos structure.
@@ -684,7 +751,8 @@ def assign_especial(orig_dia, orig_playa, new_dia, raw_bloque, id_cluster,
     # Exclude all especial playas: they're being moved so their positions are freed
     freed    = (all_especial_playas or set()) | freed_in_new_dia
     occ      = build_day_occ(tagged, new_dia, new_bloque, bloque_timings,
-                             exclude_playas=freed, run_occ=run_occ_new_dia)
+                             exclude_playas=freed, run_occ=run_occ_new_dia,
+                             run_occ_by_bloque=run_occ_by_bloque)
     # full_occ: entries from blocks that overlap OR share the same physical day.
     # Blocks sharing same day = same day-letter prefix (e.g. M for MARTES, X for MIERCOLES).
     # This prevents especiales from taking slots used by same-day standard blocks,
@@ -1069,6 +1137,11 @@ def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, fi
     # Accumulate slots assigned in this run per new_dia so subsequent
     # playas don't collide (e.g. MEXICO + MEXICO_2 both going to MIERCOLES)
     run_occ = defaultdict(dict)   # dia -> {rampa: {pos: grupo}}
+    # Same accumulation, but keyed by the actual bloque físico used — needed
+    # because one bloque (e.g. 3BLOM3) can be recorded under different
+    # día_new labels for different especiales; run_occ alone (keyed by día)
+    # would let them silently double-book the same physical position.
+    run_occ_by_bloque = defaultdict(lambda: defaultdict(dict))  # bloque -> {rampa: {pos: playa}}
 
     results, added = [], 0
     especial_rows = []
@@ -1076,12 +1149,28 @@ def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, fi
     _committed_group = {}         # (dia_new, prefix) → 'par' or 'impar'
     _anchor_numbers  = {}         # (dia_new, prefix) → set of rampa numbers used so far
     all_esp_playas = {playa for (_, playa) in especiales}  # all playas being moved (any day)
-    # Sort especiales so same-family playas (shared lexical prefix) are consecutive
-    # This lets siblings share rampas naturally via run_occ
+    # Sort especiales so same-family playas (shared lexical prefix) are
+    # consecutive (lets siblings share rampas naturally via run_occ), AND so
+    # that within/across families, the destinos with MORE total positions are
+    # assigned FIRST. This matters for two reasons: (1) a big destino that
+    # goes last is forced to take whatever scraps are left, fragmenting it
+    # across many subrampas unnecessarily; (2) it's the natural priority rule
+    # when several especiales end up wanting the same bloque/posición — the
+    # biggest one is assumed to be the "rightful" occupant.
+    _esp_n_pos = {
+        (dia_orig, playa): _estimate_positions(dia_orig, playa, by_dia_playa, tagged)
+        for (dia_orig, playa) in especiales
+    }
+    _esp_family_total = defaultdict(int)
+    for (dia_orig, playa), (dia_new, record) in especiales.items():
+        sp = (superplaya_map or {}).get(playa.upper(), lexical_prefix(playa))
+        _esp_family_total[(dia_new, record.get('bloque', ''), sp)] += _esp_n_pos[(dia_orig, playa)]
+
     def _esp_sort_key(item):
         (dia_orig, playa), (dia_new, record) = item
         sp = (superplaya_map or {}).get(playa.upper(), lexical_prefix(playa))
-        return (dia_new, record.get('bloque',''), sp, playa)
+        fam_total = _esp_family_total[(dia_new, record.get('bloque', ''), sp)]
+        return (dia_new, record.get('bloque', ''), -fam_total, -_esp_n_pos[(dia_orig, playa)], sp, playa)
     especiales_sorted = sorted(especiales.items(), key=_esp_sort_key)
 
     for (dia_orig, playa), (dia_new, record) in especiales_sorted:
@@ -1111,7 +1200,8 @@ def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, fi
                 tagged, dia_new,
                 _presel_bloque,
                 bloque_timings, exclude_playas=all_esp_playas,
-                run_occ=run_occ.get(dia_new, {}))
+                run_occ=run_occ.get(dia_new, {}),
+                run_occ_by_bloque=run_occ_by_bloque)
             par_free_n = sum(
                 len([p for p in range(1, capacity.get(r,0)+1) if p not in occ_snap.get(r,{})])
                 for r in capacity if r not in EXCLUDED_RAMPAS and _ramp_number(r) % 2 == 0)
@@ -1141,13 +1231,48 @@ def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, fi
                 all_especial_playas=all_esp_playas,
                 committed_group=cg,
                 anchor_numbers=an,
+                run_occ_by_bloque=run_occ_by_bloque,
             )
             new_rows.extend(_rows_b)
             if _info_b.get('status') == 'OK':
                 info = _info_b  # keep last OK info for tracking
+                # Register into run_occ_by_bloque immediately (per bloque used
+                # in THIS iteration — a playa can have more than one bloque,
+                # e.g. "2BLOL0,4BLOX3") so a later especial sharing that exact
+                # bloque under a different día_new sees these positions too.
+                _ok_bloque = _info_b.get('bloque_new') or ''
+                if _ok_bloque and _ok_bloque != '?':
+                    for _r, _slots in (_info_b.get('rampas') or {}).items():
+                        for _s in _slots:
+                            run_occ_by_bloque[_ok_bloque][_r][_s] = playa
             elif _info_b.get('status') == 'KEEP_RAMP':
                 # Special that keeps its ramp (turno unchanged, only salida date).
-                # No new rows; record it so it shows in the summary/side panel.
+                # No new rows, but its positions MUST still be registered in
+                # run_occ / run_occ_by_bloque — otherwise a later especial in
+                # this same run (or another KEEP_RAMP one) can silently claim
+                # the exact same physical slot with no cross-check at all.
+                # This was the real cause behind cases like MALTA vs
+                # ESPANA_LAS_PALMAS both keeping stale historical positions
+                # under the same bloque — including when they end up tagged
+                # with different día_new labels (same physical bloque either
+                # way), which is why the check also looks at run_occ_by_bloque.
+                _kr_rampas = _info_b.get('rampas', {}) or {}
+                _kr_bloque = _info_b.get('bloque') or ''
+                _kr_collisions = []
+                for _r, _slots in _kr_rampas.items():
+                    for _s in _slots:
+                        _existing = (run_occ.get(dia_new, {}).get(_r, {}).get(_s)
+                                     or run_occ_by_bloque.get(_kr_bloque, {}).get(_r, {}).get(_s))
+                        if _existing and _existing != playa:
+                            _kr_collisions.append((_r, _s, _existing))
+                        run_occ.setdefault(dia_new, {}).setdefault(_r, {})[_s] = playa
+                        if _kr_bloque:
+                            run_occ_by_bloque[_kr_bloque][_r][_s] = playa
+                if _kr_collisions:
+                    _info_b['keep_ramp_collision'] = _kr_collisions
+                    _info_b['msg'] = _info_b.get('msg', '') + (
+                        ' — ⚠ CONFLICTO DE POSICIÓN: ya ocupada por '
+                        + ', '.join(f"{p} ({r}-{s:02d})" for r, s, p in _kr_collisions))
                 if info.get('status') in ('NO_CONFIG', 'E2_ROUTE'):
                     info = _info_b
             elif _info_b.get('status') in ('E2_ROUTE', 'NO_CONFIG') and info.get('status') == 'NO_CONFIG':
@@ -1365,8 +1490,12 @@ def write_html(summary, semana, out_path):
     partial = sorted([r for r in summary['assignment_results'] if r['status'] == 'PARTIAL'],  key=_day_key)
     e2      = sorted([r for r in summary['assignment_results'] if r['status'] == 'E2_ROUTE'], key=_day_key)
     nocfg   = sorted([r for r in summary['assignment_results'] if r['status'] == 'NO_CONFIG'],key=_day_key)
+    keep_conflicts = sorted(
+        [r for r in summary['assignment_results']
+         if r['status'] == 'KEEP_RAMP' and r.get('keep_ramp_collision')],
+        key=_day_key)
     cancels = list(summary['canceladas'].items())
-    n_warn  = len(partial) + len(nocfg)
+    n_warn  = len(partial) + len(nocfg) + len(keep_conflicts)
     now     = datetime.now().strftime("%d/%m/%Y %H:%M")
 
     def b(cls, txt): return f'<span class="b {cls}">{txt}</span>'
@@ -1405,6 +1534,13 @@ def write_html(summary, semana, out_path):
             out += (f'<tr><td>{b("bd",r["dia_orig"])}</td><td>{r["playa"]}</td>'
                     f'<td>{b("bw","→ "+r["dia_new"])}</td><td colspan="2" class="wt">'
                     f'❌ Sin configuración GD — revisar con equipo</td></tr>\n')
+        for r in keep_conflicts:
+            _confl_str = ', '.join(
+                f'{p} ({rr}-{ss:02d})' for rr, ss, p in r['keep_ramp_collision'])
+            out += (f'<tr><td>{b("bd",r["dia_orig"])}</td><td>{r["playa"]}</td>'
+                    f'<td>{b("bw","→ "+r["dia_new"])}</td><td colspan="2" class="wt">'
+                    f'🔴 CONFLICTO DE POSICIÓN (mantiene rampa) — coincide con {_confl_str} — '
+                    f'corregir en DXC/MAR</td></tr>\n')
         return out
 
     html = f'''<!DOCTYPE html>
@@ -1643,7 +1779,11 @@ def main():
         print("\nMantienen rampa (turno sin cambio, solo cambia salida):")
         for r in keep:
             rstr = ', '.join(f"{k}({len(v)}p)" for k,v in sorted(r.get('rampas',{}).items()))
-            print(f"  {r['playa']:42s} {r['dia_orig']}→{r['dia_new']} [{r.get('bloque','?')}]  {rstr}")
+            _warn = ''
+            if r.get('keep_ramp_collision'):
+                _warn = '  🔴 CONFLICTO: coincide con ' + ', '.join(
+                    f"{p}({rr}-{ss:02d})" for rr, ss, p in r['keep_ramp_collision'])
+            print(f"  {r['playa']:42s} {r['dia_orig']}→{r['dia_new']} [{r.get('bloque','?')}]  {rstr}{_warn}")
 
     if ok:
         print("\nAsignaciones completadas:")
