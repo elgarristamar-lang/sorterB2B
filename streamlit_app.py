@@ -87,20 +87,30 @@ def _detect_bloques_sheet(wb, event_sheet: str) -> str | None:
                 if _re.search(r'\bS' + _m.group(1) + r'\b', s, _re.IGNORECASE):
                     return s
 
-    # 3. Last resort: a Bloques* sheet, but prefer one that is NOT the plain
-    #    base 'Bloques' (which carries the normal-week timings).
+    # 3. Last resort — no exact/week-code match was found above, so we do NOT
+    #    know which campaign-specific "Bloques X" sheet (if any) applies to
+    #    this event. Picking one at random here previously caused a real bug:
+    #    an event sheet named "AGENDA_11SET" (no space after AGENDA, no S##
+    #    week code in the name) silently fell through to whichever
+    #    "Bloques X" sheet happened to appear first in the workbook — e.g.
+    #    "Bloques 25 de MAYO", a completely unrelated past campaign — giving
+    #    wrong block timings for the whole run with no visible error.
+    #    Prefer the safe, general-purpose sheet instead: 'Resumen Bloques',
+    #    then plain 'Bloques'. Only fall back to a specific campaign sheet
+    #    if NEITHER general sheet exists at all.
+    for s in sheets:
+        if s.strip().upper() == "RESUMEN BLOQUES":
+            return s
+    for s in sheets:
+        if s.strip().upper() == "BLOQUES":
+            return s
     _specific = None
-    _generic  = None
     for s in sheets:
         su2 = s.strip().upper()
-        if su2 == "RESUMEN BLOQUES":
-            continue
-        if su2 == "BLOQUES":
-            _generic = s
-        elif su2.startswith("BLOQUES"):
+        if su2.startswith("BLOQUES") and su2 not in ("BLOQUES", "RESUMEN BLOQUES"):
             if _specific is None:
                 _specific = s
-    return _specific or _generic
+    return _specific
 
 def _detect_semana(sheet_name: str, parrilla_bytes: bytes | None, selected_sheet: str) -> str:
     """
