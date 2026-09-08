@@ -269,9 +269,14 @@ def _render_output_validation(parrilla_file, gd_output_bytes: bytes, sheet_name=
                 st.markdown("\n".join(f"- `{it}`" for it in iss["items"]))
 
 def gd_to_dxc_csv(xlsx_bytes):
-    # Convert GD xlsx to DXC upload CSV format (POSTEX + SOREXP separately)
+    # Convert GD xlsx to DXC upload CSV format (POSTEX + SOREXP separately).
+    # Formato de subida directa a DXC: sin cabecera, ';', CRLF, sin BOM,
+    # columnas GRUPO;DESTINO(8);ID(2);ELEMENTO;SECUENCIA. GRUPO se deja como
+    # placeholder porque la herramienta no conoce el nombre/número real del
+    # grupo en DXC — se rellena a mano antes de subir.
     import io as _io
     from openpyxl import load_workbook as _lwb
+    GRUPO_PLACEHOLDER = "AÑADIR_NOMBRE_GRUPO_DESTINOS"
     wb = _lwb(_io.BytesIO(xlsx_bytes), read_only=True)
     rows = list(wb.active.iter_rows(values_only=True))[1:]
     postex_lines, sorexp_lines = [], []
@@ -285,11 +290,10 @@ def gd_to_dxc_csv(xlsx_bytes):
         if desc.startswith("="): continue
         d = "".join(c for c in dest_raw if c.isdigit())
         dest8 = d.zfill(10)[-8:] if d else dest_raw[:8]
-        line = f"{desc};{dest8};00;{elem}"
-        if tipo == "POSTEX": postex_lines.append(line + ";20")
-        else: sorexp_lines.append(line + ";10")
-    bom = "\ufeff"
-    def _enc(lines): return (bom + "\r\n".join(lines)).encode("utf-8")
+        line = f"{GRUPO_PLACEHOLDER};{dest8};00;{elem};10"
+        if tipo == "POSTEX": postex_lines.append(line)
+        else: sorexp_lines.append(line)
+    def _enc(lines): return ("\r\n".join(lines) + ("\r\n" if lines else "")).encode("utf-8")
     return _enc(postex_lines), _enc(sorexp_lines)
 
 
