@@ -297,9 +297,10 @@ def gd_to_dxc_csv(xlsx_bytes):
         if not desc or tipo not in ("POSTEX","SOREXP") or not dest_raw or not elem: continue
         if desc.startswith("="): continue
         d = "".join(c for c in dest_raw if c.isdigit())
-        dest8 = d.zfill(10)[-8:] if d else dest_raw[:8]
+        d10 = d.zfill(10) if d else "0000000000"
+        _id, dest8 = d10[:2], d10[2:]
         _playa = _playa_from_desc(desc) or "AÑADIR_NOMBRE_GRUPO_DESTINOS"
-        line = f"{_playa};{dest8};00;{elem};10"
+        line = f"{_playa};{dest8};{_id};{elem};10"
         if tipo == "POSTEX": postex_lines.append(line)
         else: sorexp_lines.append(line)
     def _enc(lines): return ("\r\n".join(lines) + ("\r\n" if lines else "")).encode("utf-8")
