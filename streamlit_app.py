@@ -5,6 +5,24 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).parent
 
+# ── Capacidad de rampas por defecto ──────────────────────────────────────────
+# Se usa siempre que el usuario no suba su propio CSV en "Capacidad de rampas".
+# Mismo formato que el fichero real (RAMP;PALLETS, CRLF). Sube un fichero en
+# la app solo si necesitas sobreescribir estos valores para una semana
+# concreta (p.ej. una rampa fuera de servicio o una capacidad distinta).
+DEFAULT_RAMP_CAPACITY_CSV = (
+    "RAMP;PALLETS\r\n"
+    "R00C;7\r\nR00D;10\r\nR02A;12\r\nR02B;14\r\nR02C;14\r\nR02D;14\r\n"
+    "R03A;14\r\nR03B;14\r\nR03C;13\r\nR03D;13\r\nR04A;12\r\nR04B;14\r\n"
+    "R04C;14\r\nR04D;14\r\nR05A;14\r\nR05B;14\r\nR05C;13\r\nR05D;13\r\n"
+    "R06A;13\r\nR06B;10\r\nR06C;14\r\nR06D;14\r\nR07A;14\r\nR07B;14\r\n"
+    "R07C;13\r\nR07D;13\r\nR08A;12\r\nR08B;10\r\nR08C;10\r\nR08D;14\r\n"
+    "R09A;14\r\nR09B;14\r\nR09C;13\r\nR09D;13\r\nR10A;12\r\nR10B;14\r\n"
+    "R10C;14\r\nR10D;14\r\nR11A;14\r\nR11B;14\r\nR11C;13\r\nR11D;13\r\n"
+    "R12A;12\r\nR12B;14\r\nR12C;14\r\nR12D;14\r\nR13A;14\r\nR13B;14\r\n"
+    "R13C;12\r\nR13D;13\r\n"
+).encode("utf-8")
+
 # ── Hojas base que NO son hojas de evento especial ───────────────────────────
 _BASE_SHEET_NAMES = {
     "B2B", "B2C", "BLOQUES", "RESUMEN BLOQUES", "VOLUMENES", "APY",
@@ -412,8 +430,8 @@ with col1:
 with col2:
     f_gd  = st.file_uploader("GRUPO_DESTINOS", type=["xlsx"],
                                help="Export DXC o fichero clásico")
-    f_cap = st.file_uploader("Capacidad de rampas", type=["csv"],
-                               help="CSV con columnas RAMP;PALLETS")
+    f_cap = st.file_uploader("Capacidad de rampas (opcional)", type=["csv"],
+                               help="CSV con columnas RAMP;PALLETS. Si no subes nada, se usa la capacidad por defecto.")
 
 # Bloques horarios: optional if embedded in parrilla, required otherwise
 _bloques_help = "Columnas: NUEVO BLOQUE · Día LIBERACIÓN · Hora LIBERACIÓN · Día DESACTIVACIÓN · Hora DESACTIVACIÓN"
@@ -463,12 +481,14 @@ def save_uploads(tmp: Path):
         f_gd.seek(0)
         p["gd"] = path
 
-    # Cap
+    # Cap — si no se sube fichero, se usa la capacidad de rampas por defecto
+    path = tmp / "cap.csv"
     if f_cap:
-        path = tmp / "cap.csv"
         path.write_bytes(f_cap.read())
         f_cap.seek(0)
-        p["cap"] = path
+    else:
+        path.write_bytes(DEFAULT_RAMP_CAPACITY_CSV)
+    p["cap"] = path
 
     # Bloques: explicit upload overrides embedded sheet
     if f_bloques:
@@ -645,7 +665,7 @@ st.markdown("### Acciones")
 # bloques available = either uploaded or embedded in parrilla
 _bloques_available = bool(f_bloques or _embedded_bloques_sheet)
 
-base_ok      = bool(f_parrilla and f_gd and f_cap)
+base_ok      = bool(f_parrilla and f_gd)
 vis_ok       = bool(base_ok and _bloques_available)
 sortmap_done = bool(st.session_state.get("r3_map"))
 _normal_week = _is_normal_week_sheet(sheet)
@@ -838,7 +858,7 @@ if st.session_state["r1_gd"] is not None:
         )
         selected_days = [b.split()[0] for b in selected_bloques]
         if st.button("⚙️ Regenerar con filtro", key="regen_filter",
-                     disabled=not (selected_bloques and f_parrilla and f_gd and f_cap)):
+                     disabled=not (selected_bloques and f_parrilla and f_gd)):
             days_arg = ",".join(selected_days)
             with tempfile.TemporaryDirectory() as _tmp:
                 tmp = Path(_tmp)
