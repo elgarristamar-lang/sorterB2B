@@ -52,6 +52,25 @@ NOVEDADES:
   ESPANA_TENERIFE) pasan a reportarse como PARCIALES — genuinamente no hay
   hueco físico suficiente para ellas esta semana bajo 3BLOM3 una vez que se
   deja de "prestarles" espacio que en realidad usan otros destinos.
+  * Menos dispersión: al decidir qué rampa usar, una rampa con hueco libre
+    real (aunque tenga algún dato histórico en otras posiciones, p.ej. tras
+    liberarse una CANCELADA) competía en desventaja frente a rampas casi
+    llenas con 1-2 huecos sueltos, solo por no estar "100% vacía" a nivel
+    de todo el día. Ahora, entre rampas "no vacías", también se prefiere la
+    que tiene más hueco libre real. Con datos reales: ESPANA_COORDINACION_
+    LEGANES pasó de 4 subrampas dispersas a 2, ESPANA_ZARAGOZA de 4 a 3 —
+    aprovechando el hueco que dejó la cancelación de ARABIA_SAUDI_FCA.
+  * "Vacía" se decide ahora por el hueco REAL (0 conflictos de verdad),
+    no por si arrastra cualquier dato histórico de otro bloque sin
+    relación (p.ej. una rampa 100% libre para X4 podía perder frente a
+    rampas peor aprovechadas solo por tener historial de un bloque J que
+    ni siquiera ocupa ninguna posición ahí). Efecto real verificado: al
+    aplicar este fix, R12D (100% libre para X4) pasa a competir en
+    igualdad — se la lleva ESPANA_CATALUNYA (bloque J1, que sí solapa de
+    verdad en horario con X4 y necesita mucho más volumen, 48 posiciones,
+    así que se procesa antes) en vez de quedar ignorada; ESPANA_COORDINACION_
+    LEGANES mejora de 5 a 4 subrampas dispersas — menos que antes, aunque
+    limitado por la competencia real de Catalunya por ese mismo hueco.
 """
 
 import sys, re, csv, os, shutil, tempfile, json
@@ -553,12 +572,21 @@ def find_free_slots(occ, capacity, n_needed,
         # Prefer rampas that have enough slots for the whole playa (avoid splitting)
         has_enough = len(free) >= rem
         _any_occ = full_occ if full_occ is not None else occ
-        is_empty   = len(_any_occ.get(r, {})) == 0
+        # "Vacía" se decide primero por el hueco REAL (occ, la restricción dura):
+        # si nada bloquea ni una sola posición, la rampa cuenta como vacía sin
+        # importar qué historial irrelevante de OTRO bloque (full_occ) tenga
+        # ahí — antes una rampa 100% libre (0 conflictos reales) podía perder
+        # frente a rampas casi llenas solo por arrastrar datos de un bloque
+        # sin relación real (mismo día que se solapa en horario, pero sin
+        # ocupar ninguna posición realmente en juego). full_occ se usa solo
+        # como desempate suave cuando el hueco real no es ya total.
+        is_hard_empty = len(free) == capacity.get(r, 0)
+        is_empty = is_hard_empty or len(_any_occ.get(r, {})) == 0
         in_group   = committed_group is None or _ramp_group(r) == committed_group
         prox       = _ramp_proximity_key(r, _anchor) if _anchor else _ramp_number(r)
         mate       = pair_of(r)
         mate_free  = len(get_free(mate)) if mate and mate not in EXCLUDED_RAMPAS else 0
-        eff_prox = prox if (is_empty and _anchor) else (-len(free) if is_empty else 1000 + prox)
+        eff_prox = prox if (is_empty and _anchor) else (-len(free) if is_empty else 1000 + prox - len(free))
         # has_enough=True sorts first (0 < 1)
         return (-int(in_group), -int(has_enough), eff_prox, -int(mate_free > 0), -(len(free) + mate_free))
 
