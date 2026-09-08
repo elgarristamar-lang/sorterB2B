@@ -1585,10 +1585,8 @@ def write_dxc_csv(output_rows, out_dir, base_name):
     Write POSTEX_<base_name>.csv and SOREXP_<base_name>.csv in the exact
     format DXC expects for a direct bulk upload: no header, ';'-delimited,
     CRLF line endings, columns GRUPO;DESTINO(8);ID(2);ELEMENTO;SECUENCIA.
-    The GRUPO column is always the literal placeholder
-    "AÑADIR_NOMBRE_GRUPO_DESTINOS" — this tool doesn't know (and shouldn't
-    guess) the real DXC group name/number, so whoever finalizes the upload
-    fills it in before importing.
+    GRUPO is the destino/playa name extracted from the row's own
+    description (e.g. "MEXICO", "ESPANA_CATALUNYA").
     Returns the two output paths.
     """
     paths = {}
@@ -1600,7 +1598,11 @@ def write_dxc_csv(output_rows, out_dir, base_name):
                 if str(tipo_zona).strip().upper() != tipo_filter: continue
                 if not desc or str(desc).startswith('='): continue
                 _id, _dest = _split_destino(destino)
-                f.write(f'AÑADIR_NOMBRE_GRUPO_DESTINOS;{_dest};{_id};{elemento};10\r\n')
+                _, _, _playa_name = parse_gd_desc(desc)
+                if _playa_name:
+                    _playa_name = re.sub(r'\s*\(.*$', '', _playa_name).strip()
+                _grupo_name = _playa_name or 'AÑADIR_NOMBRE_GRUPO_DESTINOS'
+                f.write(f'{_grupo_name};{_dest};{_id};{elemento};10\r\n')
         paths[tipo_filter] = out_path
     return paths
 
