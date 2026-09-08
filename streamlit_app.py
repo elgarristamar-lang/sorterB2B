@@ -271,12 +271,20 @@ def _render_output_validation(parrilla_file, gd_output_bytes: bytes, sheet_name=
 def gd_to_dxc_csv(xlsx_bytes):
     # Convert GD xlsx to DXC upload CSV format (POSTEX + SOREXP separately).
     # Formato de subida directa a DXC: sin cabecera, ';', CRLF, sin BOM,
-    # columnas GRUPO;DESTINO(8);ID(2);ELEMENTO;SECUENCIA. GRUPO se deja como
-    # placeholder porque la herramienta no conoce el nombre/número real del
-    # grupo en DXC — se rellena a mano antes de subir.
-    import io as _io
+    # columnas GRUPO;DESTINO(8);ID(2);ELEMENTO;SECUENCIA. GRUPO es el nombre
+    # del destino/playa extraído de la propia descripción de la fila.
+    import io as _io, re as _re
     from openpyxl import load_workbook as _lwb
-    GRUPO_PLACEHOLDER = "AÑADIR_NOMBRE_GRUPO_DESTINOS"
+    _DAY_RE = _re.compile(
+        r"(DOMINGO|LUNES|MARTES|MIERCOLES|JUEVES|VIERNES|SABADO)_(.+?)(?:\s*\(|\s*$)",
+        _re.IGNORECASE)
+    def _playa_from_desc(desc):
+        core = _re.sub(r'^\[B2B\]\s*', '', desc).strip()
+        m = _DAY_RE.search(core)
+        if m:
+            return m.group(2).strip()
+        m2 = _re.match(r'^IRREGULAR_(.+)$', core, _re.IGNORECASE)
+        return m2.group(1).strip() if m2 else None
     wb = _lwb(_io.BytesIO(xlsx_bytes), read_only=True)
     rows = list(wb.active.iter_rows(values_only=True))[1:]
     postex_lines, sorexp_lines = [], []
@@ -290,7 +298,8 @@ def gd_to_dxc_csv(xlsx_bytes):
         if desc.startswith("="): continue
         d = "".join(c for c in dest_raw if c.isdigit())
         dest8 = d.zfill(10)[-8:] if d else dest_raw[:8]
-        line = f"{GRUPO_PLACEHOLDER};{dest8};00;{elem};10"
+        _playa = _playa_from_desc(desc) or "AÑADIR_NOMBRE_GRUPO_DESTINOS"
+        line = f"{_playa};{dest8};00;{elem};10"
         if tipo == "POSTEX": postex_lines.append(line)
         else: sorexp_lines.append(line)
     def _enc(lines): return ("\r\n".join(lines) + ("\r\n" if lines else "")).encode("utf-8")
