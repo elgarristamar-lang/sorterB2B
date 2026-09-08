@@ -1580,6 +1580,31 @@ def write_gd(output_rows, header, out_path):
     wb.save(out_path)
 
 
+def write_dxc_csv(output_rows, out_dir, base_name):
+    """
+    Write POSTEX_<base_name>.csv and SOREXP_<base_name>.csv in the exact
+    format DXC expects for a direct bulk upload: no header, ';'-delimited,
+    CRLF line endings, columns GRUPO;DESTINO(8);ID(2);ELEMENTO;SECUENCIA.
+    The GRUPO column is always the literal placeholder
+    "AÑADIR_NOMBRE_GRUPO_DESTINOS" — this tool doesn't know (and shouldn't
+    guess) the real DXC group name/number, so whoever finalizes the upload
+    fills it in before importing.
+    Returns the two output paths.
+    """
+    paths = {}
+    for tipo_filter, prefix in [('POSTEX', 'POSTEX'), ('SOREXP', 'SOREXP')]:
+        out_path = os.path.join(out_dir, f'{prefix}_{base_name}.csv')
+        with open(out_path, 'w', newline='', encoding='utf-8') as f:
+            for row in output_rows:
+                _, grupo, desc, tipo_zona, destino, almacen, elemento = row
+                if str(tipo_zona).strip().upper() != tipo_filter: continue
+                if not desc or str(desc).startswith('='): continue
+                _id, _dest = _split_destino(destino)
+                f.write(f'AÑADIR_NOMBRE_GRUPO_DESTINOS;{_dest};{_id};{elemento};10\r\n')
+        paths[tipo_filter] = out_path
+    return paths
+
+
 # ─── WRITE HTML ───────────────────────────────────────────────────────────────
 
 def write_html(summary, semana, out_path):
@@ -1946,6 +1971,14 @@ def main():
         esp_out = str(gd_out).replace('.xlsx', '_SOLO_ESPECIALES.xlsx')
         write_especiales_gd(summary['especial_rows'], gd_header, esp_out)
         print(f"  + Especiales    → {esp_out}")
+        # CSV listo para subir a DXC (formato bulk: GRUPO;DESTINO;ID;ELEMENTO;SECUENCIA,
+        # sin cabecera, ';' y CRLF). GRUPO se deja como placeholder porque esta
+        # herramienta no conoce el nombre/número real del grupo en DXC.
+        _csv_dir = os.path.dirname(esp_out) or '.'
+        _csv_base = os.path.splitext(os.path.basename(esp_out))[0]
+        _csv_paths = write_dxc_csv(summary['especial_rows'], _csv_dir, _csv_base)
+        print(f"  + CSV DXC       → {_csv_paths['POSTEX']}")
+        print(f"                    {_csv_paths['SOREXP']}")
 
     # Canceladas list (rows to DELETE)
     can_out = str(gd_out).replace('.xlsx', '_CANCELADAS.txt')
