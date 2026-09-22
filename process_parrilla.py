@@ -882,6 +882,15 @@ def assign_especial(orig_dia, orig_playa, new_dia, raw_bloque, id_cluster,
         'source_day':   source_day,
         'rampas':       {r: sorted(p) for r, p in rampas_used.items()},
         'n_rows':       len(rows_out),
+        # Filas de origen (antes de cualquier reasignación) — para poder
+        # exportar POSTEX/SOREXP con las posiciones ORIGINALES cuando esta
+        # especial se queda corta de hueco y hay que asignarla a mano.
+        'orig_entries': (
+            [{'destino': e['destino'], 'elemento': e['elemento'],
+              'almacen': e.get('almacen', 'CONRAM'), 'tipo_zona': 'POSTEX'} for e in postex_orig]
+            + [{'destino': e['destino'], 'elemento': e['elemento'],
+                'almacen': e.get('almacen', 'SOREXP'), 'tipo_zona': 'SOREXP'} for e in sorexp_orig]
+        ),
     }
 
 
@@ -1398,6 +1407,7 @@ def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, fi
                 _source_day  = _source_day or r.get('source_day')
             _fully_ok = all(r.get('status') in ('OK', 'KEEP_RAMP') for r in _real)
             info = dict(_real[-1])
+            info['orig_entries'] = [e for r in _real for e in r.get('orig_entries', [])]
             info['status']      = 'OK' if _fully_ok else 'PARTIAL'
             info['rampas']      = {k: sorted(v) for k, v in _merged_rampas.items()}
             info['n_assigned']  = _n_assigned
@@ -1670,6 +1680,31 @@ def write_dxc_csv(output_rows, out_dir, base_name):
                     _playa_name = re.sub(r'\s*\(.*$', '', _playa_name).strip()
                 _grupo_name = _playa_name or 'AÑADIR_NOMBRE_GRUPO_DESTINOS'
                 f.write(f'{_grupo_name};{_dest};{_id};{elemento};10\r\n')
+        paths[tipo_filter] = out_path
+    return paths
+
+
+def write_dxc_csv_originales(unassigned_results, out_dir, base_name):
+    """
+    Write POSTEX_<base_name>_ORIGINALES.csv and SOREXP_<base_name>_ORIGINALES.csv
+    for especiales that ended up PARTIAL or SIN ASIGNAR: their ORIGINAL
+    (pre-reasignación) positions, in the same DXC bulk-upload format
+    (GRUPO;DESTINO;ID;ELEMENTO;SECUENCIA, sin cabecera, ';', CRLF). GRUPO es
+    el nombre del destino. Pensado para asignación manual en DXC cuando el
+    algoritmo no encontró hueco suficiente en el bloque nuevo.
+    Returns the two output paths (empty files if nothing to export).
+    """
+    paths = {}
+    for tipo_filter, prefix in [('POSTEX', 'POSTEX'), ('SOREXP', 'SOREXP')]:
+        out_path = os.path.join(out_dir, f'{prefix}_{base_name}_ORIGINALES.csv')
+        with open(out_path, 'w', newline='', encoding='utf-8') as f:
+            for r in unassigned_results:
+                _grupo_name = r.get('playa') or 'AÑADIR_NOMBRE_GRUPO_DESTINOS'
+                for e in r.get('orig_entries', []):
+                    if str(e.get('tipo_zona', '')).strip().upper() != tipo_filter:
+                        continue
+                    _id, _dest = _split_destino(e.get('destino'))
+                    f.write(f"{_grupo_name};{_dest};{_id};{e.get('elemento','')};10\r\n")
         paths[tipo_filter] = out_path
     return paths
 
@@ -2036,6 +2071,16 @@ def main():
     _unassigned = [r for r in summary.get('assignment_results', [])
                    if r.get('status') in ('PARTIAL', 'NO_CONFIG')]
     write_gd(output_rows, gd_header, gd_out, unassigned_results=_unassigned)
+
+    # CSV con las posiciones ORIGINALES de las especiales que se quedaron
+    # cortas de hueco (o sin nada) — para asignación manual en DXC.
+    _unassigned_con_origen = [r for r in _unassigned if r.get('orig_entries')]
+    if _unassigned_con_origen:
+        _orig_dir = os.path.dirname(gd_out) or '.'
+        _orig_base = os.path.splitext(os.path.basename(gd_out))[0]
+        _orig_paths = write_dxc_csv_originales(_unassigned_con_origen, _orig_dir, _orig_base)
+        print(f"  + Originales SIN_ASIGNAR → {_orig_paths['POSTEX']}")
+        print(f"                             {_orig_paths['SOREXP']}")
 
     # Especiales-only GD (rows to ADD in DXC)
     if summary.get('especial_rows'):
