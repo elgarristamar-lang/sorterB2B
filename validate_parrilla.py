@@ -567,7 +567,8 @@ def validate(parrilla_bytes: bytes, gd_bytes: Optional[bytes] = None,
             issues.append(_issue(
                 "warning", "cobertura",
                 f"{len(fallback_orig)} especiales sin config en el día original — se usará fallback",
-                "Existen en el GD pero no en el día de origen de la parrilla. "
+                "La descripción del grupo de destinos en DXC no coincide con la "
+                "información de día + agrupación playa de la parrilla. "
                 "El script buscará el día con más posiciones y lo usará como fuente.",
                 items=items_detail,
             ))
