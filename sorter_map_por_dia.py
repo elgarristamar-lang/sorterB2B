@@ -1382,8 +1382,12 @@ def write_day_sheet(
             sr += 1
             for _na in sin_asignar_dia:
                 _estado = _na.get("estado", "")
-                _icon = "❌" if _estado == "SIN ASIGNAR" else "⚠"
-                _detalle = f"{_na.get('asignado', 0)} / {_na.get('necesario', 0)} (faltan {_na.get('faltan', 0)})"
+                if _estado == "DISPERSO":
+                    _icon = "🔀"
+                    _detalle = f"completo, pero {_na.get('faltan', '?')}"
+                else:
+                    _icon = "❌" if _estado == "SIN ASIGNAR" else "⚠"
+                    _detalle = f"{_na.get('asignado', 0)} / {_na.get('necesario', 0)} (faltan {_na.get('faltan', 0)})"
                 vals = [_icon, _na.get("playa", "?"), _na.get("bloque", "?"), _detalle]
                 alns = [_center, _left, _center, _center]
                 for ci, (val, aln) in enumerate(zip(vals, alns), SC):
