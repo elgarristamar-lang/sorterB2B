@@ -1460,6 +1460,25 @@ def process(parrilla_records, tagged, by_dia_playa, capacity, bloque_timings, fi
         output_rows.extend(new_rows)
         especial_rows.extend(new_rows)
         added += len(new_rows)
+
+        # ── Destino "muy disperso": se trata como NO ASIGNADO ───────────────
+        # Aunque haya conseguido todas sus posiciones, si necesita muchas más
+        # rampas de las que le harían falta en condiciones normales (huecos
+        # grandes y contiguos, según la capacidad habitual del grid), es una
+        # asignación mala que conviene revisar a mano — igual de indeseable
+        # que quedarse corto de hueco. "Habitual" = nº de rampas que harían
+        # falta si se llenaran al máximo de capacidad declarada en el grid;
+        # "muy disperso" = usar más de 2 rampas por encima de ese mínimo.
+        if info.get('status') in ('OK', 'PARTIAL') and info.get('rampas'):
+            _n_ramps_used = len(info['rampas'])
+            _n_pos_total = sum(len(v) for v in info['rampas'].values())
+            _habitual_cap = max(capacity.values()) if capacity else 14
+            _min_ramps = max(1, -(-_n_pos_total // _habitual_cap))  # ceil division
+            if _n_ramps_used > _min_ramps + 2:
+                info['dispersion_flagged'] = True
+                info['n_ramps_used'] = _n_ramps_used
+                info['min_ramps_habitual'] = _min_ramps
+
         results.append(info)
 
     return output_rows, {
@@ -1639,9 +1658,14 @@ def write_gd(output_rows, header, out_path, unassigned_results=None):
             n_asig = r.get('n_assigned', 0)
             n_need = r.get('n_slots', n_asig)
             faltan = max(n_need - n_asig, 0)
-            estado = 'SIN ASIGNAR' if n_asig == 0 else 'PARCIAL'
+            if r.get('dispersion_flagged'):
+                estado = 'DISPERSO'
+                _detalle = f"{r.get('n_ramps_used','?')} rampas (habitual: {r.get('min_ramps_habitual','?')})"
+            else:
+                estado = 'SIN ASIGNAR' if n_asig == 0 else 'PARCIAL'
+                _detalle = faltan
             vals = [r.get('playa', '?'), r.get('dia_orig', '?'), r.get('dia_new', '?'),
-                    r.get('bloque_new') or r.get('bloque') or '?', n_asig, n_need, faltan, estado]
+                    r.get('bloque_new') or r.get('bloque') or '?', n_asig, n_need, _detalle, estado]
             for ci, val in enumerate(vals, 1):
                 c = ws3.cell(row=ri3, column=ci, value=val)
                 c.font = _bold_red if ci == 7 else _plain
@@ -1649,9 +1673,11 @@ def write_gd(output_rows, header, out_path, unassigned_results=None):
                 if ci in (5, 6, 7): c.alignment = Alignment(horizontal='center')
             ri3 += 1
         ws3.cell(row=ri3 + 1, column=1,
-                 value=('Destinos con menos posiciones asignadas de las que necesitaban '
-                        '(o ninguna) — normalmente por falta de hueco físico libre en el '
-                        'bloque de destino esa semana. No se reasigna nada automáticamente.'))
+                 value=('Destinos con menos posiciones asignadas de las que necesitaban (o '
+                        'ninguna) — normalmente por falta de hueco físico libre en el bloque '
+                        'esa semana; o destinos DISPERSO, asignados por completo pero repartidos '
+                        'en muchas más rampas de las habituales (más de 2 por encima del mínimo '
+                        'según la capacidad del grid). Ninguno se reasigna automáticamente.'))
         ws3.cell(row=ri3 + 1, column=1).font = Font(name='Arial', size=8, italic=True, color='888888')
 
     wb.save(out_path)
@@ -2069,7 +2095,7 @@ def main():
 
     print(f"\nEscribiendo GD  → {gd_out}")
     _unassigned = [r for r in summary.get('assignment_results', [])
-                   if r.get('status') in ('PARTIAL', 'NO_CONFIG')]
+                   if r.get('status') in ('PARTIAL', 'NO_CONFIG') or r.get('dispersion_flagged')]
     write_gd(output_rows, gd_header, gd_out, unassigned_results=_unassigned)
 
     # CSV con las posiciones ORIGINALES de las especiales que se quedaron
