@@ -1556,7 +1556,7 @@ def _split_destino(destino):
     return d10[:2], d10[2:]  # id, destino
 
 
-def write_gd(output_rows, header, out_path):
+def write_gd(output_rows, header, out_path, unassigned_results=None):
     wb = Workbook(); ws = wb.active; ws.title = 'Hoja1'
     hf = PatternFill('solid', start_color='1A1A1A')
     for ci, w in enumerate([8,15,65,10,15,10,15], 1):
@@ -1604,6 +1604,45 @@ def write_gd(output_rows, header, out_path):
                 c = ws2.cell(row=ri2, column=ci, value=val)
                 c.font = df2; c.border = thin2
             ri2 += 1
+
+    # ── ⚠️ SIN_ASIGNAR: destinos que no consiguieron todo (o nada) del hueco
+    # que necesitaban — antes solo se veía en la consola/HTML de
+    # process_parrilla.py, invisible desde el propio GD/mapa del sorter.
+    if unassigned_results:
+        ws3 = wb.create_sheet('⚠️ SIN_ASIGNAR')
+        headers3 = ['PLAYA', 'DÍA ORIG', 'DÍA NUEVO', 'BLOQUE', 'ASIGNADO', 'NECESARIO', 'FALTAN', 'ESTADO']
+        widths3  = [34, 12, 12, 10, 10, 10, 10, 14]
+        hf3 = PatternFill('solid', start_color='C0392B')
+        for ci, (h, w) in enumerate(zip(headers3, widths3), 1):
+            c = ws3.cell(row=1, column=ci, value=h)
+            c.font = Font(name='Arial', bold=True, size=9, color='FFFFFF')
+            c.fill = hf3; c.alignment = Alignment(horizontal='center')
+            ws3.column_dimensions[get_column_letter(ci)].width = w
+        ws3.row_dimensions[1].height = 18
+        ws3.freeze_panes = 'A2'
+        _row_fill = PatternFill('solid', start_color='FDEDEC')
+        _bold_red = Font(name='Arial', size=9, bold=True, color='C0392B')
+        _plain    = Font(name='Arial', size=9)
+        thin3 = Border(bottom=Side(style='thin', color='EBEBEB'))
+        ri3 = 2
+        for r in sorted(unassigned_results, key=lambda r: r.get('n_assigned', 0) - r.get('n_slots', r.get('n_assigned', 0))):
+            n_asig = r.get('n_assigned', 0)
+            n_need = r.get('n_slots', n_asig)
+            faltan = max(n_need - n_asig, 0)
+            estado = 'SIN ASIGNAR' if n_asig == 0 else 'PARCIAL'
+            vals = [r.get('playa', '?'), r.get('dia_orig', '?'), r.get('dia_new', '?'),
+                    r.get('bloque_new') or r.get('bloque') or '?', n_asig, n_need, faltan, estado]
+            for ci, val in enumerate(vals, 1):
+                c = ws3.cell(row=ri3, column=ci, value=val)
+                c.font = _bold_red if ci == 7 else _plain
+                c.border = thin3; c.fill = _row_fill
+                if ci in (5, 6, 7): c.alignment = Alignment(horizontal='center')
+            ri3 += 1
+        ws3.cell(row=ri3 + 1, column=1,
+                 value=('Destinos con menos posiciones asignadas de las que necesitaban '
+                        '(o ninguna) — normalmente por falta de hueco físico libre en el '
+                        'bloque de destino esa semana. No se reasigna nada automáticamente.'))
+        ws3.cell(row=ri3 + 1, column=1).font = Font(name='Arial', size=8, italic=True, color='888888')
 
     wb.save(out_path)
 
@@ -1994,7 +2033,9 @@ def main():
             summary['especial_rows'] = _rename_if_cancelled(summary['especial_rows'])
 
     print(f"\nEscribiendo GD  → {gd_out}")
-    write_gd(output_rows, gd_header, gd_out)
+    _unassigned = [r for r in summary.get('assignment_results', [])
+                   if r.get('status') in ('PARTIAL', 'NO_CONFIG')]
+    write_gd(output_rows, gd_header, gd_out, unassigned_results=_unassigned)
 
     # Especiales-only GD (rows to ADD in DXC)
     if summary.get('especial_rows'):
