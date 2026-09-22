@@ -61,7 +61,7 @@ from collections import defaultdict
 from datetime import datetime
 
 import pandas as pd
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.comments import Comment
 from openpyxl.utils import get_column_letter
@@ -739,6 +739,8 @@ def write_day_sheet(
     especiales_salientes=None, # list of (playa, dia_new, bloque) leaving this day
     salidas_extra=None,        # list of (playa, bloque) ESPECIAL SALIDA EXTRA on this day
     grid_max_pos=None,         # ancho de rejilla global (incluye sobrecapacidad)
+    sin_asignar_dia=None,      # list of dicts: playa/bloque/asignado/necesario/faltan/estado
+                                # for this day's own PARCIAL/SIN ASIGNAR especiales
 ):
     subramps = sorted(cap_map.keys(), key=ramp_sort_key)
     max_pos = grid_max_pos or (max(cap_map.values()) if cap_map else 14)
@@ -1158,7 +1160,8 @@ def write_day_sheet(
         _cancelled_set_local = set(cancelled_esp) if cancelled_esp else set()
         # Always set SC and headers if we have anything to show
         SC = multi_col_idx + 2
-        _has_anything = esp_playa_slots or e2_playas or canceladas_dia or especiales_salientes or salidas_extra
+        _has_anything = (esp_playa_slots or e2_playas or canceladas_dia
+                          or especiales_salientes or salidas_extra or sin_asignar_dia)
         if _has_anything:
             sr = 3  # start row for side table entries
             # Column widths + headers (always when there's content)
@@ -1361,6 +1364,32 @@ def write_day_sheet(
                         c.font = _F2(size=8, bold=False, italic=True, color="999999", strike=True)
                     else:
                         c.font = _F2(size=8, bold=False, italic=True, color="BBBBBB")
+                ws.row_dimensions[sr].height = 18
+                sr += 1
+
+        # ── ⚠ NO ASIGNADOS / PARCIALES — justo debajo de la tabla de arriba ────
+        # Especiales de ESTE día que se quedaron cortas (o sin nada) de hueco.
+        if sin_asignar_dia:
+            sr += 1  # línea en blanco de separación
+            _NA_HDR_FILL = _PF2("solid", fgColor="C0392B")
+            _NA_ROW_FILL = _PF2("solid", fgColor="FDEDEC")
+            for ci, hdr_t in enumerate(
+                ["⚠", "NO ASIGNADOS / PARCIALES", "BLOQUE", "ASIGNADO / NECESARIO"], SC):
+                c = ws.cell(row=sr, column=ci, value=hdr_t)
+                c.font = _F2(size=8, bold=True, color="FFFFFF")
+                c.fill = _NA_HDR_FILL; c.border = border; c.alignment = _center
+            ws.row_dimensions[sr].height = 18
+            sr += 1
+            for _na in sin_asignar_dia:
+                _estado = _na.get("estado", "")
+                _icon = "❌" if _estado == "SIN ASIGNAR" else "⚠"
+                _detalle = f"{_na.get('asignado', 0)} / {_na.get('necesario', 0)} (faltan {_na.get('faltan', 0)})"
+                vals = [_icon, _na.get("playa", "?"), _na.get("bloque", "?"), _detalle]
+                alns = [_center, _left, _center, _center]
+                for ci, (val, aln) in enumerate(zip(vals, alns), SC):
+                    c = ws.cell(row=sr, column=ci, value=val)
+                    c.fill = _NA_ROW_FILL; c.border = border; c.alignment = aln
+                    c.font = _F2(size=8, bold=(ci == SC+3), color="C0392B")
                 ws.row_dimensions[sr].height = 18
                 sr += 1
 
@@ -2150,6 +2179,37 @@ def main():
         except Exception as _ex_par:
             print(f"  Aviso: no se pudo leer info de parrilla para resumen lateral: {_ex_par}")
 
+    # ── ⚠️ SIN_ASIGNAR por día ────────────────────────────────────────────────
+    # Si el GD trae la pestaña que genera process_parrilla.py con las
+    # especiales que se quedaron cortas de hueco, se agrupa por DÍA NUEVO
+    # para pintarla justo debajo de la tabla CAMBIOS DE SEMANA de cada día.
+    _sin_asignar_por_dia: Dict[str, list] = defaultdict(list)
+    try:
+        _sa_wb = load_workbook(GRUPO_XLSX, read_only=True, data_only=True)
+        if "⚠️ SIN_ASIGNAR" in _sa_wb.sheetnames:
+            _sa_ws = _sa_wb["⚠️ SIN_ASIGNAR"]
+            _sa_rows = list(_sa_ws.iter_rows(values_only=True))
+            if _sa_rows:
+                _sa_hdr = [str(h).strip().upper() if h else "" for h in _sa_rows[0]]
+                _sa_idx = {h: i for i, h in enumerate(_sa_hdr)}
+                for _row in _sa_rows[1:]:
+                    if not _row or not _row[0]:
+                        continue
+                    _dia_n = _row[_sa_idx.get("DÍA NUEVO", 2)]
+                    if not _dia_n:
+                        continue
+                    _sin_asignar_por_dia[str(_dia_n).strip().upper()].append({
+                        "playa":     _row[_sa_idx.get("PLAYA", 0)],
+                        "bloque":    _row[_sa_idx.get("BLOQUE", 3)],
+                        "asignado":  _row[_sa_idx.get("ASIGNADO", 4)] or 0,
+                        "necesario": _row[_sa_idx.get("NECESARIO", 5)] or 0,
+                        "faltan":    _row[_sa_idx.get("FALTAN", 6)] or 0,
+                        "estado":    _row[_sa_idx.get("ESTADO", 7)],
+                    })
+        _sa_wb.close()
+    except Exception as _sae2:
+        print(f"⚠️ No se pudo leer ⚠️ SIN_ASIGNAR para el resumen por día: {_sae2}")
+
     all_playa_data = []
     for day_name, day_code in DAY_SHEETS:
         # Detect max block index from block_intervals for this day_code
@@ -2219,6 +2279,7 @@ def main():
             especiales_salientes=_especiales_por_dia_orig.get(day_name, []),
             salidas_extra=_salidas_extra_por_dia.get(day_name, []),
             grid_max_pos=GRID_MAX_POS,
+            sin_asignar_dia=_sin_asignar_por_dia.get(day_name.upper(), []),
         )
 
         # Collect data for PLAYAS_POR_RAMPA sheet
@@ -2327,6 +2388,38 @@ def main():
             import traceback as _tb
             print(f"⚠️ Validación: {_ve}")
             _tb.print_exc()
+
+    # Si el GD trae una pestaña ⚠️ SIN_ASIGNAR (generada por process_parrilla.py
+    # para los destinos que no consiguieron todo el hueco que necesitaban),
+    # se reproduce aquí para que sea visible directamente en el mapa del
+    # sorter — antes solo se veía en la consola/HTML de process_parrilla.py.
+    try:
+        _src_wb = load_workbook(GRUPO_XLSX, read_only=True, data_only=True)
+        if "⚠️ SIN_ASIGNAR" in _src_wb.sheetnames:
+            _src_ws = _src_wb["⚠️ SIN_ASIGNAR"]
+            ws_una = wb.create_sheet("⚠️ SIN_ASIGNAR")
+            _hf = PatternFill("solid", fgColor="C0392B")
+            _row_fill = PatternFill("solid", fgColor="FDEDEC")
+            for _r_idx, _row in enumerate(_src_ws.iter_rows(values_only=True), 1):
+                for _c_idx, _val in enumerate(_row, 1):
+                    if _val is None:
+                        continue
+                    _cell = ws_una.cell(row=_r_idx, column=_c_idx, value=_val)
+                    if _r_idx == 1:
+                        _cell.font = Font(bold=True, size=9, color="FFFFFF")
+                        _cell.fill = _hf
+                        _cell.alignment = center
+                    else:
+                        _cell.font = Font(size=9, bold=(_c_idx == 7), color="C0392B" if _c_idx == 7 else "000000")
+                        _cell.fill = _row_fill
+                        if _c_idx in (5, 6, 7):
+                            _cell.alignment = center
+            for _col, _w in zip("ABCDEFGH", [34, 12, 12, 10, 10, 10, 10, 14]):
+                ws_una.column_dimensions[_col].width = _w
+            ws_una.freeze_panes = "A2"
+        _src_wb.close()
+    except Exception as _sae:
+        print(f"⚠️ No se pudo copiar ⚠️ SIN_ASIGNAR: {_sae}")
 
     out_path = _OUTPUT_PATH_ARG
     wb.save(out_path)
