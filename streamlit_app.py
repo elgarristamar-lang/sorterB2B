@@ -343,7 +343,7 @@ st.markdown("Configurador de semanas especiales — VDL B2B")
 st.divider()
 
 # ── Session state ─────────────────────────────────────────────────────────────
-for key in ["r1_gd","r1_esp","r1_can","r1_html","r2_gantt","r3_map","r1_day_filter","r1_postex_csv","r1_sorexp_csv","r1_esp_postex_csv","r1_esp_sorexp_csv"]:
+for key in ["r1_gd","r1_esp","r1_can","r1_html","r2_gantt","r3_map","r1_day_filter","r1_postex_csv","r1_sorexp_csv","r1_esp_postex_csv","r1_esp_sorexp_csv","r1_una_postex_csv","r1_una_sorexp_csv"]:
     if key not in st.session_state:
         st.session_state[key] = None
 
@@ -758,6 +758,12 @@ if st.session_state.get("_run1"):
                 _epx, _esx = gd_to_dxc_csv(esp_path.read_bytes())
                 st.session_state["r1_esp_postex_csv"] = (esp_path.stem + "_POSTEX.csv", _epx)
                 st.session_state["r1_esp_sorexp_csv"] = (esp_path.stem + "_SOREXP.csv", _esx)
+            _una_px_path = Path(str(gd.parent / f"POSTEX_{gd.stem}_ORIGINALES.csv"))
+            _una_sx_path = Path(str(gd.parent / f"SOREXP_{gd.stem}_ORIGINALES.csv"))
+            st.session_state["r1_una_postex_csv"] = (
+                _una_px_path.name, _una_px_path.read_bytes()) if _una_px_path.exists() and _una_px_path.stat().st_size else None
+            st.session_state["r1_una_sorexp_csv"] = (
+                _una_sx_path.name, _una_sx_path.read_bytes()) if _una_sx_path.exists() and _una_sx_path.stat().st_size else None
             st.session_state["r1_can"]   = (can_path.name, can_path.read_text(encoding='utf-8')) if can_path.exists() else None
             st.session_state["r1_html"]  = (html.name,  html.read_bytes()) if html.exists() else None
             st.session_state["r1_day_filter"] = None
@@ -928,6 +934,22 @@ if st.session_state["r1_gd"] is not None:
             name, data = st.session_state["r1_esp_sorexp_csv"]
             st.download_button("⬇️ SOREXP especiales", data=data, file_name=name,
                                mime="text/csv", use_container_width=True)
+
+    if st.session_state.get("r1_una_postex_csv") or st.session_state.get("r1_una_sorexp_csv"):
+        st.markdown("**⚠️ No asignados — posiciones originales (para asignar a mano en DXC):**")
+        c9, c10 = st.columns(2)
+        with c9:
+            if st.session_state.get("r1_una_postex_csv"):
+                name, data = st.session_state["r1_una_postex_csv"]
+                st.download_button("⬇️ POSTEX no asignados", data=data, file_name=name,
+                                   mime="text/csv", use_container_width=True)
+        with c10:
+            if st.session_state.get("r1_una_sorexp_csv"):
+                name, data = st.session_state["r1_una_sorexp_csv"]
+                st.download_button("⬇️ SOREXP no asignados", data=data, file_name=name,
+                                   mime="text/csv", use_container_width=True)
+        st.caption("Destinos que se quedaron cortos (o sin nada) de hueco en el bloque nuevo — "
+                   "posiciones tal como estaban antes de intentar reasignarlas.")
 
     c3, c4 = st.columns(2)
     with c3:
